@@ -27,6 +27,11 @@ BOT_TOKEN = os.environ.get(
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "2068530616"))
 DB_NAME = os.environ.get("DB_NAME", "rsp_otp_bot.db")
 
+ENV_API_URL = os.environ.get(
+    "VOLTEX_API_URL", "https://api.2oo9.cloud/MXS47FLFX0U/tnevs/@public/api"
+)
+ENV_API_KEY = os.environ.get("VOLTEX_API_KEY", "")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -34,8 +39,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_conn() -> sqlite3.Connection:
+    return sqlite3.connect(DB_NAME, timeout=15)
+
+
 def init_db() -> None:
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
 
     cursor.execute(
@@ -87,14 +96,25 @@ def init_db() -> None:
 
     default_settings = {
         "bot_name": "RSP OTP BOT",
-        "api_url": "https://api.example.com/stubs/handler_api.php",
-        "api_key": "",
-        "support_contact": "@admin",
+        "api_url": ENV_API_URL,
+        "api_key": ENV_API_KEY,
+        "support_contact": "@reyad0045",
     }
     for key, val in default_settings.items():
         cursor.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             (key, val),
+        )
+
+    if os.environ.get("VOLTEX_API_URL"):
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('api_url', ?)",
+            (os.environ["VOLTEX_API_URL"].strip(),),
+        )
+    if os.environ.get("VOLTEX_API_KEY"):
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('api_key', ?)",
+            (os.environ["VOLTEX_API_KEY"].strip(),),
         )
 
     default_services = [
@@ -115,16 +135,22 @@ def init_db() -> None:
 
 
 def get_setting(key: str, default: str = "") -> str:
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
     row = cursor.fetchone()
     conn.close()
-    return row[0] if row and row[0] is not None else default
+    if row and row[0]:
+        return row[0]
+    if key == "api_url" and ENV_API_URL:
+        return ENV_API_URL
+    if key == "api_key" and ENV_API_KEY:
+        return ENV_API_KEY
+    return default
 
 
 def set_setting(key: str, value: str) -> None:
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
@@ -135,7 +161,7 @@ def set_setting(key: str, value: str) -> None:
 
 
 def ensure_user(user_id: int, username: str = "", full_name: str = "") -> None:
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -158,7 +184,7 @@ def ensure_user(user_id: int, username: str = "", full_name: str = "") -> None:
 
 
 def get_user_balance(user_id: int) -> float:
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
@@ -167,7 +193,7 @@ def get_user_balance(user_id: int) -> float:
 
 
 def get_all_services():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT id, code, name, price, stock FROM services ORDER BY id ASC")
     rows = cursor.fetchall()
@@ -176,7 +202,7 @@ def get_all_services():
 
 
 def get_service_by_code(code: str):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, code, name, price, stock FROM services WHERE code = ?",
@@ -188,7 +214,7 @@ def get_service_by_code(code: str):
 
 
 def create_demo_order(user_id: int, service_code: str):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT stock FROM services WHERE code = ? AND stock > 0",
@@ -220,8 +246,9 @@ def create_demo_order(user_id: int, service_code: str):
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        [KeyboardButton("📱 নম্বর নিন"), KeyboardButton("📦 স্টক দেখুন")],
-        [KeyboardButton("💰 ব্যালেন্স"), KeyboardButton("🆘 সাপোর্ট")],
+        [KeyboardButton("🟢 নম্বর নিন"), KeyboardButton("🔵 স্টক দেখুন")],
+        [KeyboardButton("🟡 ব্যালেন্স"), KeyboardButton("🟣 লিডারবোর্ড")],
+        [KeyboardButton("🟠 সাপোর্ট"), KeyboardButton("🔴 অ্যাডমিন প্যানেল")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -256,7 +283,7 @@ async def send_stock_cards(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
+    if not update.effective_user or not update.effective_chat or not update.message:
         return
 
     user = update.effective_user
@@ -265,7 +292,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     welcome_text = (
         f"👋 স্বাগতম **{bot_name}**-এ!\n\n"
-        f"নিচের মেনু থেকে আপনার প্রয়োজনীয় অপশন বেছে নিন অথবা যেকোনো সার্ভিসের কার্ড থেকে নম্বর সংগ্রহ করুন।"
+        f"নিচের মেনু থেকে আপনার প্রয়োজনীয় অপশন বেছে নিন অথবা যেকোনো সার্ভিসের কার্ড থেকে নম্বর সংগ্রহ করুন।\n"
+        f"⏳ *নোট: বট কিছুক্ষণ নিষ্ক্রিয় থাকলে প্রথম রিপ্লাই আসতে ৩০–৬০ সেকেন্ড সময় লাগতে পারে।*"
     )
     await update.message.reply_text(
         welcome_text,
@@ -273,6 +301,39 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         reply_markup=main_menu_keyboard(),
     )
     await send_stock_cards(update.effective_chat.id, context)
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ এই কমান্ডটি শুধুমাত্র অ্যাডমিনের জন্য।")
+        return
+
+    bot_name = get_setting("bot_name", "RSP OTP BOT")
+    api_url = get_setting("api_url", "")
+    api_key = get_setting("api_key", "")
+    masked_key = (
+        f"{api_key[:4]}***{api_key[-4:]}"
+        if len(api_key) >= 8
+        else ("সেট করা আছে" if api_key else "সেট করা নেই")
+    )
+
+    panel_text = (
+        f"🛠️ **অ্যাডমিন প্যানেল**\n\n"
+        f"🤖 **বটের নাম:** {bot_name}\n"
+        f"🔗 **API URL:** `{api_url}`\n"
+        f"🔑 **API Key:** `{masked_key}`\n\n"
+        f"**ব্যবহারযোগ্য কমান্ডসমূহ:**\n"
+        f"• `/setname নতুন নাম`\n"
+        f"• `/setapiurl https://...`\n"
+        f"• `/setapikey আপনার_কি`"
+    )
+    await update.message.reply_text(panel_text, parse_mode="Markdown")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -283,19 +344,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     ensure_user(user.id, user.username or "", user.full_name or "")
     text = update.message.text.strip()
 
-    if text == "📱 নম্বর নিন" or text == "📦 স্টক দেখুন":
+    if text in ("🟢 নম্বর নিন", "🔵 স্টক দেখুন", "📱 নম্বর নিন", "📦 স্টক দেখুন"):
         await send_stock_cards(update.effective_chat.id, context)
-    elif text == "💰 ব্যালেন্স":
+    elif text in ("🟡 ব্যালেন্স", "💰 ব্যালেন্স"):
         balance = get_user_balance(user.id)
         await update.message.reply_text(
-            f"💰 আপনার বর্তমান ব্যালেন্স: **৳{balance:.2f}**",
+            f"🟡 আপনার বর্তমান ব্যালেন্স: **৳{balance:.2f}**",
             parse_mode="Markdown",
         )
-    elif text == "🆘 সাপোর্ট":
-        support = get_setting("support_contact", "@admin")
+    elif text == "🟣 লিডারবোর্ড":
         await update.message.reply_text(
-            f"🆘 যেকোনো সহায়তার জন্য যোগাযোগ করুন: {support}",
+            "🟣 **লিডারবোর্ড**\n\nবর্তমানে লিডারবোর্ড ডেটা আপডেট হচ্ছে।",
+            parse_mode="Markdown",
         )
+    elif text in ("🟠 সাপোর্ট", "🆘 সাপোর্ট"):
+        support = get_setting("support_contact", "@reyad0045")
+        await update.message.reply_text(
+            f"🟠 যেকোনো সহায়তার জন্য যোগাযোগ করুন: {support}",
+        )
+    elif text == "🔴 অ্যাডমিন প্যানেল":
+        await admin_panel(update, context)
     else:
         await update.message.reply_text(
             "ℹ️ অনুগ্রহ করে নিচের মেনু থেকে একটি অপশন বেছে নিন অথবা `/start` লিখুন।",
@@ -306,7 +374,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not query or not query.data or not query.from_user:
+    if not query or not query.data or not query.from_user or not query.message:
         return
 
     await query.answer()
@@ -343,39 +411,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"💵 **মূল্য:** ৳{price:.2f}"
         )
         await query.message.reply_text(reply_text, parse_mode="Markdown")
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ এই কমান্ডটি শুধুমাত্র অ্যাডমিনের জন্য।")
-        return
-
-    bot_name = get_setting("bot_name", "RSP OTP BOT")
-    api_url = get_setting("api_url", "")
-    api_key = get_setting("api_key", "")
-    masked_key = (
-        f"{api_key[:4]}***{api_key[-4:]}"
-        if len(api_key) >= 8
-        else ("সেট করা আছে" if api_key else "সেট করা নেই")
-    )
-
-    panel_text = (
-        f"🛠️ **অ্যাডমিন প্যানেল**\n\n"
-        f"🤖 **বটের নাম:** {bot_name}\n"
-        f"🔗 **API URL:** `{api_url}`\n"
-        f"🔑 **API Key:** `{masked_key}`\n\n"
-        f"**ব্যবহারযোগ্য কমান্ডসমূহ:**\n"
-        f"• `/setname নতুন নাম`\n"
-        f"• `/setapiurl https://...`\n"
-        f"• `/setapikey আপনার_কি`"
-    )
-    await update.message.reply_text(panel_text, parse_mode="Markdown")
 
 
 async def set_bot_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -442,14 +477,11 @@ def home():
 
 def run_web_server() -> None:
     port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
+    web_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
 def main() -> None:
     init_db()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     threading.Thread(target=run_web_server, daemon=True).start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -462,7 +494,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("বট চালু হয়েছে...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
