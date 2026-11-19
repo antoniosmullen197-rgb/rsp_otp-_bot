@@ -1,13 +1,9 @@
 import asyncio
-import datetime
-import json
 import logging
 import os
 import random
 import sqlite3
 import threading
-import urllib.parse
-import urllib.request
 from flask import Flask
 from telegram import (
     InlineKeyboardButton,
@@ -29,29 +25,12 @@ BOT_TOKEN = os.environ.get(
     "BOT_TOKEN", "9178685196:AAGnHHXm7at9Pt8IWIW-zPdiOPkl564dl3U"
 )
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "2068530616"))
-# এখানে প্রয়োজনে কমা দিয়ে আরও অ্যাডমিন আইডি সরাসরি যুক্ত করতে পারবেন
-ADMIN_IDS: set[int] = {ADMIN_ID}
-
-SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@reyad0045")
-
-VOLTEX_API_KEY = os.environ.get("VOLTEX_API_KEY", "MOFUE6IU9NF")
-VOLTEX_API_URL = os.environ.get("VOLTEX_API_URL", "")
-
 DB_NAME = os.environ.get("DB_NAME", "rsp_otp_bot.db")
 
-COUNTRIES = [
-    ("Italy", "it", "+39"),
-    ("Bangladesh", "bd", "+880"),
-    ("Indonesia", "id", "+62"),
-    ("United Kingdom", "gb", "+44"),
-]
-
-SERVICES = [
-    ("Facebook", "fb"),
-    ("Telegram", "tg"),
-    ("WhatsApp", "wa"),
-    ("Gmail", "gm"),
-]
+ENV_API_URL = os.environ.get(
+    "VOLTEX_API_URL", "https://api.2oo9.cloud/MXS47FLFX0U/tnevs/@public/api"
+)
+ENV_API_KEY = os.environ.get("VOLTEX_API_KEY", "")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -60,8 +39,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_conn() -> sqlite3.Connection:
+    return sqlite3.connect(DB_NAME, timeout=15)
+
+
 def init_db() -> None:
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
 
     cursor.execute(
@@ -75,23 +58,24 @@ def init_db() -> None:
 
     cursor.execute(
         """
-        CREATE TABLE IF NOT EXISTS admins (
+        CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+            username TEXT,
+            full_name TEXT,
+            balance REAL DEFAULT 0.0,
+            joined_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
 
     cursor.execute(
         """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            balance REAL DEFAULT 21.30,
-            otp_count INTEGER DEFAULT 0,
-            joined_at TEXT DEFAULT CURRENT_TIMESTAMP
+        CREATE TABLE IF NOT EXISTS services (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE,
+            name TEXT,
+            price REAL,
+            stock INTEGER DEFAULT 0
         )
         """
     )
@@ -101,29 +85,20 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            country_name TEXT,
-            service_name TEXT,
+            service_code TEXT,
             phone_number TEXT,
-            status TEXT DEFAULT 'ACTIVE',
+            otp_code TEXT,
+            status TEXT DEFAULT 'PENDING',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
 
-    for aid in ADMIN_IDS:
-        cursor.execute(
-            "INSERT OR IGNORE INTO admins (user_id, added_by) VALUES (?, ?)",
-            (aid, ADMIN_ID),
-        )
-
     default_settings = {
-        "bot_name": "VOLTEX SMS",
-        "api_url": VOLTEX_API_URL,
-        "api_key": VOLTEX_API_KEY,
-        "rate_per_otp": "0.30",
-        "level_name": "Diamond",
-        "otp_group": "https://t.me/",
-        "support_contact": SUPPORT_USERNAME,
+        "bot_name": "RSP OTP BOT",
+        "api_url": ENV_API_URL,
+        "api_key": ENV_API_KEY,
+        "support_contact": "@reyad0045",
     }
     for key, val in default_settings.items():
         cursor.execute(
@@ -131,81 +106,51 @@ def init_db() -> None:
             (key, val),
         )
 
-    cursor.execute(
-        "UPDATE settings SET value = ? WHERE key = 'api_key' AND (value IS NULL OR value = '')",
-        (VOLTEX_API_KEY,),
-    )
+    if os.environ.get("VOLTEX_API_URL"):
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('api_url', ?)",
+            (os.environ["VOLTEX_API_URL"].strip(),),
+        )
+    if os.environ.get("VOLTEX_API_KEY"):
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('api_key', ?)",
+            (os.environ["VOLTEX_API_KEY"].strip(),),
+        )
 
-    cursor.execute(
-        "UPDATE settings SET value = ? WHERE key = 'support_contact'",
-        (SUPPORT_USERNAME,),
-    )
+    default_services = [
+        ("tg", "Telegram", 15.0, 25),
+        ("wa", "WhatsApp", 20.0, 18),
+        ("fb", "Facebook", 12.0, 30),
+        ("ig", "Instagram", 10.0, 40),
+        ("gm", "Gmail", 14.0, 22),
+    ]
+    for code, name, price, stock in default_services:
+        cursor.execute(
+            "INSERT OR IGNORE INTO services (code, name, price, stock) VALUES (?, ?, ?, ?)",
+            (code, name, price, stock),
+        )
 
     conn.commit()
     conn.close()
-
-
-def is_admin(user_id: int) -> bool:
-    uid = int(user_id)
-    if uid in ADMIN_IDS:
-        return True
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (uid,))
-    found = cursor.fetchone() is not None
-    conn.close()
-    return found
-
-
-def add_admin_db(new_admin_id: int, added_by: int) -> bool:
-    uid = int(new_admin_id)
-    ADMIN_IDS.add(uid)
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO admins (user_id, added_by) VALUES (?, ?)",
-        (uid, int(added_by)),
-    )
-    changed = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
-    return changed or (uid in ADMIN_IDS)
-
-
-def remove_admin_db(target_admin_id: int) -> bool:
-    uid = int(target_admin_id)
-    if uid == ADMIN_ID:
-        return False
-    ADMIN_IDS.discard(uid)
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM admins WHERE user_id = ?", (uid,))
-    changed = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
-    return changed
-
-
-def get_all_admins_db() -> list[int]:
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM admins ORDER BY user_id ASC")
-    db_ids = {int(r[0]) for r in cursor.fetchall()}
-    conn.close()
-    return sorted(db_ids | ADMIN_IDS)
 
 
 def get_setting(key: str, default: str = "") -> str:
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
     row = cursor.fetchone()
     conn.close()
-    return row[0] if row and row[0] is not None else default
+    if row and row[0]:
+        return row[0]
+    if key == "api_url" and ENV_API_URL:
+        return ENV_API_URL
+    if key == "api_key" and ENV_API_KEY:
+        return ENV_API_KEY
+    return default
 
 
 def set_setting(key: str, value: str) -> None:
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
@@ -216,12 +161,12 @@ def set_setting(key: str, value: str) -> None:
 
 
 def ensure_user(user_id: int, username: str = "", full_name: str = "") -> None:
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT OR IGNORE INTO users (user_id, username, full_name, balance, otp_count)
-        VALUES (?, ?, ?, 21.30, 0)
+        INSERT OR IGNORE INTO users (user_id, username, full_name, balance)
+        VALUES (?, ?, ?, 0.0)
         """,
         (user_id, username or "", full_name or ""),
     )
@@ -238,195 +183,155 @@ def ensure_user(user_id: int, username: str = "", full_name: str = "") -> None:
     conn.close()
 
 
-def get_user_stats(user_id: int) -> tuple[float, int]:
-    conn = sqlite3.connect(DB_NAME)
+def get_user_balance(user_id: int) -> float:
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT balance, otp_count FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return float(row[0]), int(row[1])
-    return 0.0, 0
+    return float(row[0]) if row else 0.0
 
 
-def get_leaderboard(limit: int = 10):
-    conn = sqlite3.connect(DB_NAME)
+def get_all_services():
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT full_name, username, otp_count, balance
-        FROM users
-        ORDER BY otp_count DESC, balance DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
+    cursor.execute("SELECT id, code, name, price, stock FROM services ORDER BY id ASC")
     rows = cursor.fetchall()
     conn.close()
     return rows
 
 
-def fetch_voltex_numbers(
-    country_name: str,
-    country_code: str,
-    dial_code: str,
-    service_name: str,
-    service_code: str,
-) -> list[str]:
-    api_url = get_setting("api_url", VOLTEX_API_URL).strip()
-    api_key = get_setting("api_key", VOLTEX_API_KEY).strip()
-
-    if api_url and api_key:
-        try:
-            params = {
-                "api_key": api_key,
-                "key": api_key,
-                "action": "getNumber",
-                "country": country_code,
-                "service": service_code,
-            }
-            sep = "&" if "?" in api_url else "?"
-            full_url = f"{api_url}{sep}{urllib.parse.urlencode(params)}"
-            req = urllib.request.Request(full_url, headers={"User-Agent": "VoltexBot/1.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                raw = resp.read().decode("utf-8", errors="ignore").strip()
-
-            try:
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    for k in ("number", "phone", "data"):
-                        val = data.get(k)
-                        if isinstance(val, str) and len(val) >= 7:
-                            return [val if val.startswith("+") else f"+{val}"]
-                        if isinstance(val, dict) and val.get("number"):
-                            num = str(val["number"])
-                            return [num if num.startswith("+") else f"+{num}"]
-            except json.JSONDecodeError:
-                pass
-
-            for token in raw.replace(":", " ").replace(",", " ").split():
-                clean = token.strip().lstrip("+")
-                if clean.isdigit() and 8 <= len(clean) <= 15:
-                    return [f"+{clean}"]
-        except Exception as exc:
-            logger.warning("Voltex API fetch fallback: %s", exc)
-
-    return [
-        f"{dial_code}{random.randint(3000000000, 3999999999)}",
-        f"{dial_code}{random.randint(3000000000, 3999999999)}",
-        f"{dial_code}{random.randint(3000000000, 3999999999)}",
-    ]
-
-
-def save_order(user_id: int, country_name: str, service_name: str, phone_number: str) -> None:
-    conn = sqlite3.connect(DB_NAME)
+def get_service_by_code(code: str):
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
+        "SELECT id, code, name, price, stock FROM services WHERE code = ?",
+        (code,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def create_demo_order(user_id: int, service_code: str):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT stock FROM services WHERE code = ? AND stock > 0",
+        (service_code,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    cursor.execute(
+        "UPDATE services SET stock = stock - 1 WHERE code = ? AND stock > 0",
+        (service_code,),
+    )
+    phone_number = f"+8801{random.choice(['3', '4', '5', '6', '7', '8', '9'])}{random.randint(10000000, 99999999)}"
+    otp_code = f"{random.randint(100000, 999999)}"
+    cursor.execute(
         """
-        INSERT INTO orders (user_id, country_name, service_name, phone_number, status)
+        INSERT INTO orders (user_id, service_code, phone_number, otp_code, status)
         VALUES (?, ?, ?, ?, 'ACTIVE')
         """,
-        (user_id, country_name, service_name, phone_number),
+        (user_id, service_code, phone_number, otp_code),
     )
+    order_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    return order_id, phone_number, otp_code
 
 
-def main_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton("📞 Get Number"), KeyboardButton("📊 Live Traffic")],
-        [KeyboardButton("💳 Wallet"), KeyboardButton("🏆 Leaderboard")],
-        [KeyboardButton("🙋‍♂️ Support")],
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton("🟢 Get Number"), KeyboardButton("🔵 Live Traffic")],
+        [KeyboardButton("🟡 Wallet"), KeyboardButton("🟣 Leaderboard")],
+        [KeyboardButton("🟠 Support"), KeyboardButton("🔴 Admin Panel")],
     ]
-    if is_admin(user_id):
-        rows.append([KeyboardButton("🛠️ Admin Panel")])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
-def number_card_keyboard(numbers: list[str], c_idx: int, s_idx: int) -> InlineKeyboardMarkup:
-    otp_group = get_setting("otp_group", "https://t.me/")
-    rows = []
-    for num in numbers:
-        rows.append([InlineKeyboardButton(f"☎️ 📋 {num}", callback_data=f"pick_{num}")])
-
-    rows.append(
-        [
-            InlineKeyboardButton("🔄 Change", callback_data=f"chg_{c_idx}_{s_idx}"),
-            InlineKeyboardButton("🌍 Country", callback_data=f"cnt_{c_idx}_{s_idx}"),
-        ]
-    )
-    if otp_group and otp_group.startswith(("http://", "https://")):
-        rows.append([InlineKeyboardButton("💬 OTP Group", url=otp_group)])
-    else:
-        rows.append([InlineKeyboardButton("💬 OTP Group", callback_data="otp_group_info")])
-
-    return InlineKeyboardMarkup(rows)
-
-
-def country_picker_keyboard(c_idx: int, s_idx: int) -> InlineKeyboardMarkup:
-    rows = []
-    for idx, (cname, _, dial) in enumerate(COUNTRIES):
-        mark = "✅ " if idx == c_idx else ""
-        rows.append(
-            [InlineKeyboardButton(f"{mark}{cname} ({dial})", callback_data=f"setcnt_{idx}_{s_idx}")]
-        )
-    return InlineKeyboardMarkup(rows)
-
-
-def admin_inline_keyboard() -> InlineKeyboardMarkup:
+def service_card_keyboard(code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("👥 Admins", callback_data="adm_list"),
-                InlineKeyboardButton("🔌 Voltex API", callback_data="adm_api"),
-            ],
-            [
-                InlineKeyboardButton("📖 Commands", callback_data="adm_cmds"),
-            ],
-        ]
+        [[InlineKeyboardButton("✅ নম্বর কিনুন", callback_data=f"buy_{code}")]]
     )
 
 
-async def build_number_card(c_idx: int, s_idx: int) -> tuple[str, list[str]]:
-    country_name, country_code, dial_code = COUNTRIES[c_idx % len(COUNTRIES)]
-    service_name, service_code = SERVICES[s_idx % len(SERVICES)]
-    now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
-    numbers = fetch_voltex_numbers(
-        country_name, country_code, dial_code, service_name, service_code
+async def send_stock_cards(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    services = get_all_services()
+    if not services:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ বর্তমানে কোনো সার্ভিস স্টকে নেই।",
+        )
+        return
+
+    for _, code, name, price, stock in services:
+        text = (
+            f"📌 **সার্ভিস:** {name} (`{code.upper()}`)\n"
+            f"💵 **মূল্য:** ৳{price:.2f}\n"
+            f"📦 **উপলব্ধ স্টক:** {stock} টি"
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=service_card_keyboard(code),
+        )
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ এই কমান্ডটি শুধুমাত্র অ্যাডমিনের জন্য।")
+        return
+
+    bot_name = get_setting("bot_name", "RSP OTP BOT")
+    api_url = get_setting("api_url", "")
+    api_key = get_setting("api_key", "")
+    masked_key = (
+        f"{api_key[:4]}***{api_key[-4:]}"
+        if len(api_key) >= 8
+        else ("সেট করা আছে" if api_key else "সেট করা নেই")
     )
 
-    card_text = (
-        f"┏━━━━━━━━━━━━━━━━━━┓\n"
-        f"   🌍 **{country_name} TOP Fresh Number**\n"
-        f"   📱 **{service_name} • ⏱️ 10M**\n"
-        f"   🔄 **Refreshed:** `{now_str}`\n"
-        f"┗━━━━━━━━━━━━━━━━━━┛"
+    panel_text = (
+        f"🛠️ **অ্যাডমিন প্যানেল**\n\n"
+        f"🤖 **বটের নাম:** {bot_name}\n"
+        f"🔗 **API URL:** `{api_url}`\n"
+        f"🔑 **API Key:** `{masked_key}`\n\n"
+        f"**ব্যবহারযোগ্য কমান্ডসমূহ:**\n"
+        f"• `/setname নতুন নাম`\n"
+        f"• `/setapiurl https://...`\n"
+        f"• `/setapikey আপনার_কি`"
     )
-    return card_text, numbers
+    await update.message.reply_text(panel_text, parse_mode="Markdown")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
+    if not update.effective_user or not update.effective_chat or not update.message:
         return
 
     user = update.effective_user
     ensure_user(user.id, user.username or "", user.full_name or "")
-    bot_name = get_setting("bot_name", "VOLTEX SMS")
-    rate = get_setting("rate_per_otp", "0.30")
-    level = get_setting("level_name", "Diamond")
-    balance, otp_count = get_user_stats(user.id)
+    bot_name = get_setting("bot_name", "RSP OTP BOT")
 
-    text = (
-        f"⚡ **{bot_name}**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 **OTPs:** `{otp_count}`  |  💳 **৳{balance:.2f} TK**\n"
-        f"💎 **Rate:** `৳{rate}/OTP` ({level})\n\n"
-        f"📌 **Important Method:** নিচের মেনু থেকে **Get Number** চাপুন।"
+    welcome_text = (
+        f"👋 স্বাগতম **{bot_name}**-এ!\n\n"
+        f"নিচের মেনু থেকে আপনার প্রয়োজনীয় অপশন বেছে নিন।\n"
+        f"⏳ *নোট: বট কিছুক্ষণ নিষ্ক্রিয় থাকলে প্রথম রিপ্লাই আসতে ৩০–৬০ সেকেন্ড সময় লাগতে পারে।*"
     )
     await update.message.reply_text(
-        text,
+        welcome_text,
         parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(user.id),
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -437,103 +342,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     ensure_user(user.id, user.username or "", user.full_name or "")
     text = update.message.text.strip()
-    balance, otp_count = get_user_stats(user.id)
-    rate = get_setting("rate_per_otp", "0.30")
-    level = get_setting("level_name", "Diamond")
 
-    if text == "📞 Get Number":
-        c_idx = int(context.user_data.get("c_idx", 0))
-        s_idx = int(context.user_data.get("s_idx", 0))
-        card_text, numbers = await build_number_card(c_idx, s_idx)
-        await update.message.reply_text(
-            card_text,
-            parse_mode="Markdown",
-            reply_markup=number_card_keyboard(numbers, c_idx, s_idx),
+    if text == "🟢 Get Number":
+        await send_stock_cards(update.effective_chat.id, context)
+    elif text == "🔵 Live Traffic":
+        api_url = get_setting("api_url", "")
+        api_key = get_setting("api_key", "")
+        status_text = (
+            f"📊 **Live Traffic**\n\n"
+            f"🔗 **Voltex URL:** `{api_url if api_url else 'Not Set'}`\n"
+            f"🔑 **Key Status:** {'Ready' if api_key else 'Not Set'}\n"
+            f"• Facebook: Active\n"
+            f"• Telegram: Active\n"
+            f"• WhatsApp: Active"
         )
-
-    elif text == "📊 Live Traffic":
-        now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
-        api_status = "Connected" if get_setting("api_url", "") else "Key Ready (URL Pending)"
+        await update.message.reply_text(status_text, parse_mode="Markdown")
+    elif text == "🟡 Wallet":
+        balance = get_user_balance(user.id)
         await update.message.reply_text(
-            f"📊 **Live Traffic**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔌 **Voltex Panel:** `{api_status}`\n"
-            f"🕒 **Updated:** `{now_str}`\n"
-            f"• Facebook: `Active`\n"
-            f"• Telegram: `Active`\n"
-            f"• WhatsApp: `Active`",
+            f"🟡 আপনার বর্তমান ব্যালেন্স: **৳{balance:.2f}**",
             parse_mode="Markdown",
         )
-
-    elif text == "💳 Wallet":
+    elif text == "🟣 Leaderboard":
         await update.message.reply_text(
-            f"💳 **Wallet**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 **Balance:** `৳{balance:.2f} TK`\n"
-            f"📨 **Total OTPs:** `{otp_count}`\n"
-            f"👑 **Level:** `{level}` (`৳{rate}/OTP`)",
+            "🟣 **Leaderboard**\n\nবর্তমানে লিডারবোর্ড ডেটা আপডেট হচ্ছে।",
             parse_mode="Markdown",
         )
-
-    elif text == "🏆 Leaderboard":
-        top_users = get_leaderboard(10)
-        if not top_users:
-            await update.message.reply_text("🏆 এখনো কোনো লিডারবোর্ড ডেটা নেই।")
-            return
-        lines = ["🏆 **Top OTP Leaderboard**\n"]
-        for i, (fname, uname, count_val, bal) in enumerate(top_users, start=1):
-            label = fname or (f"@{uname}" if uname else "User")
-            lines.append(f"{i}. **{label}** — `{count_val}` OTP (`৳{bal:.2f}`)")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    elif text == "🙋‍♂️ Support":
-        support = get_setting("support_contact", SUPPORT_USERNAME)
-        await update.message.reply_text(f"🙋‍♂️ **Support:** {support}", parse_mode="Markdown")
-
-    elif text == "🛠️ Admin Panel":
-        if not is_admin(user.id):
-            await update.message.reply_text("⛔ শুধুমাত্র অ্যাডমিনের জন্য।")
-            return
-        await send_admin_panel_message(update.message)
-
+    elif text == "🟠 Support":
+        support = get_setting("support_contact", "@reyad0045")
+        await update.message.reply_text(
+            f"🟠 যেকোনো সহায়তার জন্য যোগাযোগ করুন: {support}",
+        )
+    elif text == "🔴 Admin Panel":
+        await admin_panel(update, context)
     else:
         await update.message.reply_text(
-            "নিচের মেনু থেকে অপশন বেছে নিন অথবা `/start` লিখুন।",
-            reply_markup=main_reply_keyboard(user.id),
+            "ℹ️ অনুগ্রহ করে নিচের মেনু থেকে একটি অপশন বেছে নিন অথবা `/start` লিখুন।",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
         )
-
-
-async def send_admin_panel_message(message) -> None:
-    bot_name = get_setting("bot_name", "VOLTEX SMS")
-    api_url = get_setting("api_url", "") or "Not Set"
-    api_key = get_setting("api_key", VOLTEX_API_KEY)
-    support = get_setting("support_contact", SUPPORT_USERNAME)
-    masked_key = (
-        f"{api_key[:4]}***{api_key[-4:]}"
-        if len(api_key) >= 8
-        else ("Set" if api_key else "Not Set")
-    )
-    admins = get_all_admins_db()
-
-    panel_text = (
-        f"🛠️ **Admin Panel**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 **Bot:** {bot_name}\n"
-        f"🙋‍♂️ **Support:** {support}\n"
-        f"👮 **Admins:** `{len(admins)}`\n"
-        f"🔗 **Voltex URL:** `{api_url}`\n"
-        f"🔑 **Voltex Key:** `{masked_key}`\n\n"
-        f"**Commands:**\n"
-        f"• `/setsupport @username`\n"
-        f"• `/setapiurl <url>`\n"
-        f"• `/setapikey <key>`\n"
-        f"• `/addadmin <user_id>`\n"
-        f"• `/removeadmin <user_id>`\n"
-        f"• `/admins`"
-    )
-    await message.reply_text(
-        panel_text, parse_mode="Markdown", reply_markup=admin_inline_keyboard()
-    )
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -544,175 +391,54 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     user = query.from_user
     ensure_user(user.id, user.username or "", user.full_name or "")
-    data = query.data
 
-    if data.startswith("pick_"):
-        phone_number = data.replace("pick_", "", 1)
-        c_idx = int(context.user_data.get("c_idx", 0))
-        s_idx = int(context.user_data.get("s_idx", 0))
-        country_name, _, _ = COUNTRIES[c_idx % len(COUNTRIES)]
-        service_name, _ = SERVICES[s_idx % len(SERVICES)]
-        save_order(user.id, country_name, service_name, phone_number)
-
-        await query.message.reply_text(
-            f"✅ **Number Selected**\n"
-            f"📱 **Number:** `{phone_number}`\n"
-            f"🌍 **Country:** {country_name}\n"
-            f"📌 **Service:** {service_name}\n"
-            f"⏳ **Status:** Waiting for OTP...",
-            parse_mode="Markdown",
-        )
-
-    elif data.startswith("chg_"):
-        parts = data.split("_")
-        c_idx = int(parts[1]) if len(parts) > 1 else 0
-        s_idx = (int(parts[2]) + 1) % len(SERVICES) if len(parts) > 2 else 1
-        context.user_data["c_idx"] = c_idx
-        context.user_data["s_idx"] = s_idx
-        card_text, numbers = await build_number_card(c_idx, s_idx)
-        await query.message.edit_text(
-            card_text,
-            parse_mode="Markdown",
-            reply_markup=number_card_keyboard(numbers, c_idx, s_idx),
-        )
-
-    elif data.startswith("cnt_"):
-        parts = data.split("_")
-        c_idx = int(parts[1]) if len(parts) > 1 else 0
-        s_idx = int(parts[2]) if len(parts) > 2 else 0
-        await query.message.reply_text(
-            "🌍 **Select Country:**",
-            parse_mode="Markdown",
-            reply_markup=country_picker_keyboard(c_idx, s_idx),
-        )
-
-    elif data.startswith("setcnt_"):
-        parts = data.split("_")
-        c_idx = int(parts[1]) if len(parts) > 1 else 0
-        s_idx = int(parts[2]) if len(parts) > 2 else 0
-        context.user_data["c_idx"] = c_idx
-        context.user_data["s_idx"] = s_idx
-        card_text, numbers = await build_number_card(c_idx, s_idx)
-        await query.message.reply_text(
-            card_text,
-            parse_mode="Markdown",
-            reply_markup=number_card_keyboard(numbers, c_idx, s_idx),
-        )
-
-    elif data == "otp_group_info":
-        await query.message.reply_text("💬 OTP Group লিংক সেট করা হয়নি।")
-
-    elif data.startswith("adm_"):
-        if not is_admin(user.id):
-            await query.message.reply_text("⛔ শুধুমাত্র অ্যাডমিন।")
+    if query.data.startswith("buy_"):
+        code = query.data.replace("buy_", "", 1)
+        service = get_service_by_code(code)
+        if not service:
+            await query.message.reply_text("❌ এই সার্ভিসটি খুঁজে পাওয়া যায়নি।")
             return
-        if data == "adm_list":
-            admins = get_all_admins_db()
-            lines = [
-                f"• `{aid}` {'👑 Main' if aid == ADMIN_ID else '🛡️ Admin'}"
-                for aid in admins
-            ]
+
+        _, _, name, price, stock = service
+        if stock <= 0:
             await query.message.reply_text(
-                "👮 **Admins:**\n\n" + "\n".join(lines), parse_mode="Markdown"
-            )
-        elif data == "adm_api":
-            key_val = get_setting("api_key", VOLTEX_API_KEY)
-            await query.message.reply_text(
-                f"🔌 **Voltex API Config**\n"
-                f"URL: `{get_setting('api_url', '') or 'Not Set'}`\n"
-                f"Key: `{key_val}`",
+                f"⚠️ **{name}** সার্ভিসের স্টক শেষ হয়ে গেছে!",
                 parse_mode="Markdown",
             )
-        elif data == "adm_cmds":
-            await query.message.reply_text(
-                "`/setsupport @reyad0045`\n"
-                "`/setapiurl https://voltex-api-url`\n"
-                "`/setapikey MOFUE6IU9NF`\n"
-                "`/addadmin 123456789`\n"
-                "`/removeadmin 123456789`\n"
-                "`/admins`",
-                parse_mode="Markdown",
-            )
+            return
 
+        order = create_demo_order(user.id, code)
+        if not order:
+            await query.message.reply_text("⚠️ স্টক আপডেট করা যায়নি, আবার চেষ্টা করুন।")
+            return
 
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ শুধুমাত্র অ্যাডমিনের জন্য।")
-        return
-    await send_admin_panel_message(update.message)
-
-
-async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("ব্যবহার: `/addadmin 123456789`", parse_mode="Markdown")
-        return
-    try:
-        new_id = int(context.args[0].strip())
-    except ValueError:
-        await update.message.reply_text("❌ সঠিক User ID দিন।")
-        return
-    add_admin_db(new_id, update.effective_user.id)
-    await update.message.reply_text(f"✅ অ্যাডমিন যুক্ত হয়েছে: `{new_id}`", parse_mode="Markdown")
-
-
-async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("ব্যবহার: `/removeadmin 123456789`", parse_mode="Markdown")
-        return
-    try:
-        target_id = int(context.args[0].strip())
-    except ValueError:
-        await update.message.reply_text("❌ সঠিক User ID দিন।")
-        return
-    if target_id == ADMIN_ID:
-        await update.message.reply_text("⛔ প্রধান অ্যাডমিন সরানো যাবে না।")
-        return
-    if remove_admin_db(target_id):
-        await update.message.reply_text(
-            f"🗑️ `{target_id}` সরানো হয়েছে।", parse_mode="Markdown"
+        order_id, phone_number, otp_code = order
+        reply_text = (
+            f"✅ **নম্বর জেনারেট হয়েছে!**\n\n"
+            f"🧾 **অর্ডার ID:** `#{order_id}`\n"
+            f"📌 **সার্ভিস:** {name}\n"
+            f"📱 **নম্বর:** `{phone_number}`\n"
+            f"🔐 **ডেমো OTP কোড:** `{otp_code}`\n"
+            f"💵 **মূল্য:** ৳{price:.2f}"
         )
-    else:
-        await update.message.reply_text("❌ পাওয়া যায়নি।")
+        await query.message.reply_text(reply_text, parse_mode="Markdown")
 
 
-async def list_admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def set_bot_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
     if not is_admin(update.effective_user.id):
         return
-    admins = get_all_admins_db()
-    lines = [
-        f"• `{aid}` {'👑 Main' if aid == ADMIN_ID else '🛡️ Admin'}" for aid in admins
-    ]
-    await update.message.reply_text("👮 **Admins:**\n\n" + "\n".join(lines), parse_mode="Markdown")
 
+    new_name = " ".join(context.args).strip()
+    if not new_name:
+        await update.message.reply_text("ব্যবহার: `/setname RSP OTP BOT`", parse_mode="Markdown")
+        return
 
-async def set_support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text(
-            "ব্যবহার: `/setsupport @reyad0045`", parse_mode="Markdown"
-        )
-        return
-    uname = context.args[0].strip()
-    if not uname.startswith("@"):
-        uname = f"@{uname}"
-    set_setting("support_contact", uname)
+    set_setting("bot_name", new_name)
     await update.message.reply_text(
-        f"✅ Support ইউজারনেম সেট হয়েছে: {uname}", parse_mode="Markdown"
+        f"✅ বটের নাম পরিবর্তন করে **{new_name}** করা হয়েছে।",
+        parse_mode="Markdown",
     )
 
 
@@ -721,16 +447,17 @@ async def set_api_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not is_admin(update.effective_user.id):
         return
+
     if not context.args:
         await update.message.reply_text(
-            "ব্যবহার: `/setapiurl https://example.com/api`", parse_mode="Markdown"
+            "ব্যবহার: `/setapiurl https://example.com/api`",
+            parse_mode="Markdown",
         )
         return
+
     url = context.args[0].strip()
     set_setting("api_url", url)
-    await update.message.reply_text(
-        f"✅ Voltex API URL সেট হয়েছে:\n`{url}`", parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"✅ API URL সেট করা হয়েছে:\n`{url}`", parse_mode="Markdown")
 
 
 async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -738,14 +465,17 @@ async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not is_admin(update.effective_user.id):
         return
+
     if not context.args:
         await update.message.reply_text(
-            "ব্যবহার: `/setapikey MOFUE6IU9NF`", parse_mode="Markdown"
+            "ব্যবহার: `/setapikey আপনার_api_key`",
+            parse_mode="Markdown",
         )
         return
+
     key = context.args[0].strip()
     set_setting("api_key", key)
-    await update.message.reply_text("✅ Voltex API Key সেট হয়েছে।")
+    await update.message.reply_text("✅ API Key সফলভাবে সংরক্ষণ করা হয়েছে।")
 
 
 web_app = Flask(__name__)
@@ -753,35 +483,29 @@ web_app = Flask(__name__)
 
 @web_app.route("/")
 def home():
-    return "Bot is running!", 200
+    return "RSP OTP Bot is running!", 200
 
 
 def run_web_server() -> None:
     port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
+    web_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
 def main() -> None:
     init_db()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     threading.Thread(target=run_web_server, daemon=True).start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("addadmin", add_admin_cmd))
-    app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
-    app.add_handler(CommandHandler("admins", list_admins_cmd))
-    app.add_handler(CommandHandler("setsupport", set_support_cmd))
+    app.add_handler(CommandHandler("setname", set_bot_name))
     app.add_handler(CommandHandler("setapiurl", set_api_url))
     app.add_handler(CommandHandler("setapikey", set_api_key))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("বট চালু হয়েছে...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
