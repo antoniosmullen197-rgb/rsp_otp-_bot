@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import random
@@ -7,6 +8,7 @@ from flask import Flask
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -19,250 +21,417 @@ from telegram.ext import (
     filters,
 )
 
+BOT_TOKEN = os.environ.get(
+    "BOT_TOKEN", "9178685196:AAGnHHXm7at9Pt8IWIW-zPdiOPkl564dl3U"
+)
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "2068530616"))
+DB_NAME = os.environ.get("DB_NAME", "rsp_otp_bot.db")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
-# ================= কনফিগারেশন =================
-BOT_TOKEN = os.getenv(
-    "BOT_TOKEN", "9178685196:AAGnHHXm7at9Pt8IWIW-zPdiOPkl564dl3U"
-)
-ADMIN_ID = int(os.getenv("ADMIN_ID", "2068530616"))
-DB_PATH = "otp_bot.db"
 
-# ================= ডাটাবেস =================
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
+def init_db() -> None:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
 
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
     )
-    """
-)
 
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS stock (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        service_name TEXT,
-        country TEXT,
-        price TEXT,
-        quantity INTEGER DEFAULT 10
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            balance REAL DEFAULT 0.0,
+            joined_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
     )
-    """
-)
-conn.commit()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS services (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE,
+            name TEXT,
+            price REAL,
+            stock INTEGER DEFAULT 0
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            service_code TEXT,
+            phone_number TEXT,
+            otp_code TEXT,
+            status TEXT DEFAULT 'PENDING',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    default_settings = {
+        "bot_name": "RSP OTP BOT",
+        "api_url": "https://api.example.com/stubs/handler_api.php",
+        "api_key": "",
+        "support_contact": "@admin",
+    }
+    for key, val in default_settings.items():
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            (key, val),
+        )
+
+    default_services = [
+        ("tg", "Telegram", 15.0, 25),
+        ("wa", "WhatsApp", 20.0, 18),
+        ("fb", "Facebook", 12.0, 30),
+        ("ig", "Instagram", 10.0, 40),
+        ("gm", "Gmail", 14.0, 22),
+    ]
+    for code, name, price, stock in default_services:
+        cursor.execute(
+            "INSERT OR IGNORE INTO services (code, name, price, stock) VALUES (?, ?, ?, ?)",
+            (code, name, price, stock),
+        )
+
+    conn.commit()
+    conn.close()
 
 
-def get_setting(key: str, default: str) -> str:
+def get_setting(key: str, default: str = "") -> str:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
     cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
     row = cursor.fetchone()
-    return row[0] if row else default
+    conn.close()
+    return row[0] if row and row[0] is not None else default
 
 
 def set_setting(key: str, value: str) -> None:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
     cursor.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
         (key, value),
     )
     conn.commit()
+    conn.close()
 
 
-def ensure_default_stock() -> None:
-    cursor.execute("SELECT COUNT(*) FROM stock")
-    count = cursor.fetchone()[0]
-    if count == 0:
-        sample_items = [
-            ("Telegram OTP", "Bangladesh (+880)", "$0.35", 25),
-            ("WhatsApp OTP", "Indonesia (+62)", "$0.25", 40),
-            ("Gmail / Google OTP", "USA (+1)", "$0.40", 15),
-        ]
-        cursor.executemany(
-            "INSERT INTO stock (service_name, country, price, quantity) VALUES (?, ?, ?, ?)",
-            sample_items,
-        )
-        conn.commit()
+def ensure_user(user_id: int, username: str = "", full_name: str = "") -> None:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO users (user_id, username, full_name, balance)
+        VALUES (?, ?, ?, 0.0)
+        """,
+        (user_id, username or "", full_name or ""),
+    )
+    cursor.execute(
+        """
+        UPDATE users
+        SET username = COALESCE(NULLIF(?, ''), username),
+            full_name = COALESCE(NULLIF(?, ''), full_name)
+        WHERE user_id = ?
+        """,
+        (username or "", full_name or "", user_id),
+    )
+    conn.commit()
+    conn.close()
 
 
-ensure_default_stock()
+def get_user_balance(user_id: int) -> float:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return float(row[0]) if row else 0.0
 
 
-# ================= কিবোর্ড ও কার্ড =================
+def get_all_services():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, code, name, price, stock FROM services ORDER BY id ASC")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def get_service_by_code(code: str):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, code, name, price, stock FROM services WHERE code = ?",
+        (code,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def create_demo_order(user_id: int, service_code: str):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT stock FROM services WHERE code = ? AND stock > 0",
+        (service_code,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    cursor.execute(
+        "UPDATE services SET stock = stock - 1 WHERE code = ? AND stock > 0",
+        (service_code,),
+    )
+    phone_number = f"+8801{random.choice(['3', '4', '5', '6', '7', '8', '9'])}{random.randint(10000000, 99999999)}"
+    otp_code = f"{random.randint(100000, 999999)}"
+    cursor.execute(
+        """
+        INSERT INTO orders (user_id, service_code, phone_number, otp_code, status)
+        VALUES (?, ?, ?, ?, 'ACTIVE')
+        """,
+        (user_id, service_code, phone_number, otp_code),
+    )
+    order_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return order_id, phone_number, otp_code
+
+
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        ["📱 নম্বর নিন", "📦 স্টক দেখুন"],
-        ["💰 ব্যালেন্স", "🆘 সাপোর্ট"],
+        [KeyboardButton("📱 নম্বর নিন"), KeyboardButton("📦 স্টক দেখুন")],
+        [KeyboardButton("💰 ব্যালেন্স"), KeyboardButton("🆘 সাপোর্ট")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
-async def send_stock_cards(update: Update) -> None:
-    cursor.execute(
-        "SELECT id, service_name, country, price, quantity FROM stock WHERE quantity > 0"
+def service_card_keyboard(code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ নম্বর কিনুন", callback_data=f"buy_{code}")]]
     )
-    rows = cursor.fetchall()
 
-    if not rows:
-        await update.message.reply_text("বর্তমানে কোনো নম্বর স্টকে নেই।")
+
+async def send_stock_cards(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    services = get_all_services()
+    if not services:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ বর্তমানে কোনো সার্ভিস স্টকে নেই।",
+        )
         return
 
-    for item_id, service, country, price, qty in rows:
+    for _, code, name, price, stock in services:
         text = (
-            f"🔹 *সার্ভিস:* {service}\n"
-            f"🌍 *দেশ:* {country}\n"
-            f"💵 *মূল্য:* {price}\n"
-            f"📊 *স্টক:* {qty} টি"
+            f"📌 **সার্ভিস:** {name} (`{code.upper()}`)\n"
+            f"💵 **মূল্য:** ৳{price:.2f}\n"
+            f"📦 **উপলব্ধ স্টক:** {stock} টি"
         )
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "✅ নম্বর কিনুন", callback_data=f"buy_{item_id}"
-                    )
-                ]
-            ]
-        )
-        await update.message.reply_text(
-            text, reply_markup=keyboard, parse_mode="Markdown"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=service_card_keyboard(code),
         )
 
 
-# ================= কমান্ড হ্যান্ডলার =================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat:
+        return
+
     user = update.effective_user
+    ensure_user(user.id, user.username or "", user.full_name or "")
     bot_name = get_setting("bot_name", "RSP OTP BOT")
 
-    await update.message.reply_text(
-        f"স্বাগতম {user.first_name}! *{bot_name}* চালু হয়েছে।\n"
-        f"নিচের মেনু থেকে যেকোনো অপশন বেছে নিন:",
-        reply_markup=main_menu_keyboard(),
-        parse_mode="Markdown",
+    welcome_text = (
+        f"👋 স্বাগতম **{bot_name}**-এ!\n\n"
+        f"নিচের মেনু থেকে আপনার প্রয়োজনীয় অপশন বেছে নিন অথবা যেকোনো সার্ভিসের কার্ড থেকে নম্বর সংগ্রহ করুন।"
     )
-    await send_stock_cards(update)
+    await update.message.reply_text(
+        welcome_text,
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
+    await send_stock_cards(update.effective_chat.id, context)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text or not update.effective_user or not update.effective_chat:
+        return
+
+    user = update.effective_user
+    ensure_user(user.id, user.username or "", user.full_name or "")
+    text = update.message.text.strip()
+
+    if text == "📱 নম্বর নিন" or text == "📦 স্টক দেখুন":
+        await send_stock_cards(update.effective_chat.id, context)
+    elif text == "💰 ব্যালেন্স":
+        balance = get_user_balance(user.id)
+        await update.message.reply_text(
+            f"💰 আপনার বর্তমান ব্যালেন্স: **৳{balance:.2f}**",
+            parse_mode="Markdown",
+        )
+    elif text == "🆘 সাপোর্ট":
+        support = get_setting("support_contact", "@admin")
+        await update.message.reply_text(
+            f"🆘 যেকোনো সহায়তার জন্য যোগাযোগ করুন: {support}",
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ অনুগ্রহ করে নিচের মেনু থেকে একটি অপশন বেছে নিন অথবা `/start` লিখুন।",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.from_user:
+        return
+
+    await query.answer()
+    user = query.from_user
+    ensure_user(user.id, user.username or "", user.full_name or "")
+
+    if query.data.startswith("buy_"):
+        code = query.data.replace("buy_", "", 1)
+        service = get_service_by_code(code)
+        if not service:
+            await query.message.reply_text("❌ এই সার্ভিসটি খুঁজে পাওয়া যায়নি।")
+            return
+
+        _, _, name, price, stock = service
+        if stock <= 0:
+            await query.message.reply_text(
+                f"⚠️ **{name}** সার্ভিসের স্টক শেষ হয়ে গেছে!",
+                parse_mode="Markdown",
+            )
+            return
+
+        order = create_demo_order(user.id, code)
+        if not order:
+            await query.message.reply_text("⚠️ স্টক আপডেট করা যায়নি, আবার চেষ্টা করুন।")
+            return
+
+        order_id, phone_number, otp_code = order
+        reply_text = (
+            f"✅ **নম্বর জেনারেট হয়েছে!**\n\n"
+            f"🧾 **অর্ডার ID:** `#{order_id}`\n"
+            f"📌 **সার্ভিস:** {name}\n"
+            f"📱 **নম্বর:** `{phone_number}`\n"
+            f"🔐 **ডেমো OTP কোড:** `{otp_code}`\n"
+            f"💵 **মূল্য:** ৳{price:.2f}"
+        )
+        await query.message.reply_text(reply_text, parse_mode="Markdown")
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text(
-            "⛔ এই কমান্ডটি শুধুমাত্র অ্যাডমিনের জন্য।"
-        )
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ এই কমান্ডটি শুধুমাত্র অ্যাডমিনের জন্য।")
         return
 
     bot_name = get_setting("bot_name", "RSP OTP BOT")
-    api_url = get_setting("api_url", "সেট করা হয়নি")
-    api_key = get_setting("api_key", "সেট করা হয়নি")
-
-    msg = (
-        "🛠 *অ্যাডমিন প্যানেল*\n\n"
-        f"🤖 বটের নাম: *{bot_name}*\n"
-        f"🔗 API URL: `{api_url}`\n"
-        f"🔑 API Key: `{api_key}`\n\n"
-        "*কমান্ডসমূহ:*\n"
-        "• `/setname নতুন নাম` — বটের নাম পরিবর্তন\n"
-        "• `/setapiurl https://...` — API URL সেট\n"
-        "• `/setapikey YOUR_KEY` — API Key সেট"
+    api_url = get_setting("api_url", "")
+    api_key = get_setting("api_key", "")
+    masked_key = (
+        f"{api_key[:4]}***{api_key[-4:]}"
+        if len(api_key) >= 8
+        else ("সেট করা আছে" if api_key else "সেট করা নেই")
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+
+    panel_text = (
+        f"🛠️ **অ্যাডমিন প্যানেল**\n\n"
+        f"🤖 **বটের নাম:** {bot_name}\n"
+        f"🔗 **API URL:** `{api_url}`\n"
+        f"🔑 **API Key:** `{masked_key}`\n\n"
+        f"**ব্যবহারযোগ্য কমান্ডসমূহ:**\n"
+        f"• `/setname নতুন নাম`\n"
+        f"• `/setapiurl https://...`\n"
+        f"• `/setapikey আপনার_কি`"
+    )
+    await update.message.reply_text(panel_text, parse_mode="Markdown")
 
 
-async def set_name_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if update.effective_user.id != ADMIN_ID:
+async def set_bot_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
         return
-    if not context.args:
-        await update.message.reply_text("ব্যবহার: `/setname আপনার বটের নাম`", parse_mode="Markdown")
+    if not is_admin(update.effective_user.id):
         return
-    new_name = " ".join(context.args)
+
+    new_name = " ".join(context.args).strip()
+    if not new_name:
+        await update.message.reply_text("ব্যবহার: `/setname RSP OTP BOT`", parse_mode="Markdown")
+        return
+
     set_setting("bot_name", new_name)
-    await update.message.reply_text(f"✅ বটের নাম পরিবর্তন করে *{new_name}* করা হয়েছে।", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"✅ বটের নাম পরিবর্তন করে **{new_name}** করা হয়েছে।",
+        parse_mode="Markdown",
+    )
 
 
-async def set_api_url_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if update.effective_user.id != ADMIN_ID:
+async def set_api_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
         return
+    if not is_admin(update.effective_user.id):
+        return
+
     if not context.args:
-        await update.message.reply_text("ব্যবহার: `/setapiurl https://example.com`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "ব্যবহার: `/setapiurl https://example.com/api`",
+            parse_mode="Markdown",
+        )
         return
+
     url = context.args[0].strip()
     set_setting("api_url", url)
     await update.message.reply_text(f"✅ API URL সেট করা হয়েছে:\n`{url}`", parse_mode="Markdown")
 
 
-async def set_api_key_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if update.effective_user.id != ADMIN_ID:
+async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
         return
+    if not is_admin(update.effective_user.id):
+        return
+
     if not context.args:
-        await update.message.reply_text("ব্যবহার: `/setapikey YOUR_API_KEY`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "ব্যবহার: `/setapikey আপনার_api_key`",
+            parse_mode="Markdown",
+        )
         return
+
     key = context.args[0].strip()
     set_setting("api_key", key)
     await update.message.reply_text("✅ API Key সফলভাবে সংরক্ষণ করা হয়েছে।")
 
 
-async def button_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    if query.data and query.data.startswith("buy_"):
-        item_id = query.data.split("_", 1)[1]
-        cursor.execute(
-            "SELECT service_name, country, price, quantity FROM stock WHERE id = ?",
-            (item_id,),
-        )
-        row = cursor.fetchone()
-        if not row or row[3] <= 0:
-            await query.edit_message_text("❌ দুঃখিত, এই নম্বরটি স্টক আউট হয়ে গেছে।")
-            return
-
-        service, country, price, qty = row
-        cursor.execute(
-            "UPDATE stock SET quantity = quantity - 1 WHERE id = ?", (item_id,)
-        )
-        conn.commit()
-
-        sample_number = f"+8801{random.randint(700000000, 999999999)}"
-        sample_otp = f"{random.randint(100000, 999999)}"
-
-        await query.edit_message_text(
-            f"✅ *অর্ডার কনফার্ম হয়েছে!*\n\n"
-            f"🔹 সার্ভিস: {service}\n"
-            f"🌍 দেশ: {country}\n"
-            f"📱 নম্বর: `{sample_number}`\n"
-            f"🔐 ডেমো OTP: `{sample_otp}`\n"
-            f"💵 মূল্য: {price}",
-            parse_mode="Markdown",
-        )
-
-
-async def text_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    text = update.message.text
-    if text in ["📱 নম্বর নিন", "📦 স্টক দেখুন"]:
-        await send_stock_cards(update)
-    elif text == "💰 ব্যালেন্স":
-        await update.message.reply_text("💰 আপনার বর্তমান ব্যালেন্স: *$0.00*", parse_mode="Markdown")
-    elif text == "🆘 সাপোর্ট":
-        await update.message.reply_text("🆘 যেকোনো প্রয়োজনে অ্যাডমিনের সাথে যোগাযোগ করুন।")
-    else:
-        await update.message.reply_text(
-            "মেনু থেকে অপশন বেছে নিন অথবা `/start` পাঠান।",
-            reply_markup=main_menu_keyboard(),
-        )
-
-
-# ================= Flask ওয়েব সার্ভার =================
 web_app = Flask(__name__)
 
 
@@ -276,20 +445,23 @@ def run_web_server() -> None:
     web_app.run(host="0.0.0.0", port=port)
 
 
-# ================= বট রান =================
 def main() -> None:
+    init_db()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     threading.Thread(target=run_web_server, daemon=True).start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("setname", set_name_command))
-    app.add_handler(CommandHandler("setapiurl", set_api_url_command))
-    app.add_handler(CommandHandler("setapikey", set_api_key_command))
+    app.add_handler(CommandHandler("setname", set_bot_name))
+    app.add_handler(CommandHandler("setapiurl", set_api_url))
+    app.add_handler(CommandHandler("setapikey", set_api_key))
     app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("বট চালু হয়েছে...")
+    logger.info("বট চালু হয়েছে...")
     app.run_polling(drop_pending_updates=True)
 
 
