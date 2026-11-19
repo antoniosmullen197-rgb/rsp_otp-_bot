@@ -482,6 +482,9 @@ def run_web_server() -> None:
 
 def main() -> None:
     init_db()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     threading.Thread(target=run_web_server, daemon=True).start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
