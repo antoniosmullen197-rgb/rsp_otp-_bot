@@ -137,7 +137,6 @@ def init_db() -> None:
         """
     )
 
-    # পুরনো টেবিলে নতুন কলাম না থাকলে নিরাপদে যোগ করা
     cursor.execute("PRAGMA table_info(users)")
     user_cols = {row[1] for row in cursor.fetchall()}
     if "otp_count" not in user_cols:
@@ -301,7 +300,6 @@ def generate_country_numbers(country_code: str, count: int = 3):
 
 
 def fetch_panel_traffic(api_url: str, api_key: str):
-    """সংযুক্ত প্যানেল/API থেকে লাইভ ট্রাফিক ডেটা আনার চেষ্টা করে।"""
     if not api_url:
         return None, "URL Not Set"
 
@@ -334,6 +332,10 @@ def fetch_panel_traffic(api_url: str, api_key: str):
         return None, f"HTTP {exc.code}"
     except Exception:
         return None, "Panel Sync Ready"
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 
 def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
@@ -446,10 +448,6 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
         text="\n".join(lines),
         parse_mode="Markdown",
     )
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -565,3 +563,129 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await query.answer()
     user = query.from_user
+    ensure_user(user.id, user.username or "", user.full_name or "")
+    data = query.data
+
+    if data.startswith("pick_"):
+        parts = data.split("_", 2)
+        if len(parts) == 3:
+            _, c_code, phone_number = parts
+            c_info = COUNTRIES.get(c_code, COUNTRIES["it"])
+            order_id, otp_code = record_number_claim(user.id, c_code, phone_number)
+            reply_text = (
+                f"✅ **Number Activated!**\n\n"
+                f"🧾 **Order ID:** `#{order_id}`\n"
+                f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
+                f"📱 **Phone:** `{phone_number}`\n"
+                f"🔐 **Code / OTP:** `{otp_code}`\n"
+                f"💵 **Reward:** `+৳{c_info['rate']:.2f}`"
+            )
+            await query.message.reply_text(reply_text, parse_mode="Markdown")
+
+    elif data.startswith("change_"):
+        c_code = data.replace("change_", "", 1)
+        await send_number_card(query.message.chat_id, user.id, context, country_code=c_code)
+
+    elif data == "countries_menu":
+        await query.message.reply_text(
+            "🌍 **Select Country & Dial Code:**",
+            parse_mode="Markdown",
+            reply_markup=countries_keyboard(),
+        )
+
+    elif data.startswith("setcountry_"):
+        c_code = data.replace("setcountry_", "", 1)
+        if c_code in COUNTRIES:
+            set_user_country(user.id, c_code)
+            info = COUNTRIES[c_code]
+            await query.message.reply_text(
+                f"✅ Country set to {info['flag']} **{info['name']} (`{info['dial']}`)**.",
+                parse_mode="Markdown",
+            )
+            await send_number_card(query.message.chat_id, user.id, context, country_code=c_code)
+
+    elif data == "otp_group_info":
+        support = get_setting("support_contact", "@reyad0045")
+        await query.message.reply_text(f"💬 OTP Group / Support: {support}")
+
+
+async def set_bot_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    new_name = " ".join(context.args).strip()
+    if not new_name:
+        await update.message.reply_text("Usage: `/setname RSP OTP BOT`", parse_mode="Markdown")
+        return
+    set_setting("bot_name", new_name)
+    await update.message.reply_text(f"✅ Bot name updated to **{new_name}**.", parse_mode="Markdown")
+
+
+async def set_api_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/setapiurl https://example.com/api`", parse_mode="Markdown")
+        return
+    url = context.args[0].strip()
+    set_setting("api_url", url)
+    await update.message.reply_text(f"✅ API URL saved:\n`{url}`", parse_mode="Markdown")
+
+
+async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/setapikey YOUR_API_KEY`", parse_mode="Markdown")
+        return
+    key = context.args[0].strip()
+    set_setting("api_key", key)
+    await update.message.reply_text("✅ API Key saved successfully.")
+
+
+async def set_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/setsupport @username`", parse_mode="Markdown")
+        return
+    sup = context.args[0].strip()
+    set_setting("support_contact", sup)
+    await update.message.reply_text(f"✅ Support set to `{sup}`.", parse_mode="Markdown")
+
+
+web_app = Flask(__name__)
+
+
+@web_app.route("/")
+def home():
+    return "RSP OTP Bot is running!", 200
+
+
+def run_web_server() -> None:
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+def main() -> None:
+    init_db()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    threading.Thread(target=run_web_server, daemon=True).start()
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("setname", set_bot_name))
+    app.add_handler(CommandHandler("setapiurl", set_api_url))
+    app.add_handler(CommandHandler("setapikey", set_api_key))
+    app.add_handler(CommandHandler("setsupport", set_support))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("Bot started...")
+    app.run_polling(drop_pending_updates=False)
+
+
+if __name__ == "__main__":
+    main()
