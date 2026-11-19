@@ -32,6 +32,8 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "2068530616"))
 # এখানে প্রয়োজনে কমা দিয়ে আরও অ্যাডমিন আইডি সরাসরি যুক্ত করতে পারবেন
 ADMIN_IDS: set[int] = {ADMIN_ID}
 
+SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@reyad0045")
+
 VOLTEX_API_KEY = os.environ.get("VOLTEX_API_KEY", "MOFUE6IU9NF")
 VOLTEX_API_URL = os.environ.get("VOLTEX_API_URL", "")
 
@@ -121,7 +123,7 @@ def init_db() -> None:
         "rate_per_otp": "0.30",
         "level_name": "Diamond",
         "otp_group": "https://t.me/",
-        "support_contact": "@admin",
+        "support_contact": SUPPORT_USERNAME,
     }
     for key, val in default_settings.items():
         cursor.execute(
@@ -132,6 +134,11 @@ def init_db() -> None:
     cursor.execute(
         "UPDATE settings SET value = ? WHERE key = 'api_key' AND (value IS NULL OR value = '')",
         (VOLTEX_API_KEY,),
+    )
+
+    cursor.execute(
+        "UPDATE settings SET value = ? WHERE key = 'support_contact'",
+        (SUPPORT_USERNAME,),
     )
 
     conn.commit()
@@ -480,7 +487,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     elif text == "🙋‍♂️ Support":
-        support = get_setting("support_contact", "@admin")
+        support = get_setting("support_contact", SUPPORT_USERNAME)
         await update.message.reply_text(f"🙋‍♂️ **Support:** {support}", parse_mode="Markdown")
 
     elif text == "🛠️ Admin Panel":
@@ -500,6 +507,7 @@ async def send_admin_panel_message(message) -> None:
     bot_name = get_setting("bot_name", "VOLTEX SMS")
     api_url = get_setting("api_url", "") or "Not Set"
     api_key = get_setting("api_key", VOLTEX_API_KEY)
+    support = get_setting("support_contact", SUPPORT_USERNAME)
     masked_key = (
         f"{api_key[:4]}***{api_key[-4:]}"
         if len(api_key) >= 8
@@ -511,10 +519,12 @@ async def send_admin_panel_message(message) -> None:
         f"🛠️ **Admin Panel**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 **Bot:** {bot_name}\n"
+        f"🙋‍♂️ **Support:** {support}\n"
         f"👮 **Admins:** `{len(admins)}`\n"
         f"🔗 **Voltex URL:** `{api_url}`\n"
         f"🔑 **Voltex Key:** `{masked_key}`\n\n"
         f"**Commands:**\n"
+        f"• `/setsupport @username`\n"
         f"• `/setapiurl <url>`\n"
         f"• `/setapikey <key>`\n"
         f"• `/addadmin <user_id>`\n"
@@ -615,6 +625,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         elif data == "adm_cmds":
             await query.message.reply_text(
+                "`/setsupport @reyad0045`\n"
                 "`/setapiurl https://voltex-api-url`\n"
                 "`/setapikey MOFUE6IU9NF`\n"
                 "`/addadmin 123456789`\n"
@@ -686,6 +697,25 @@ async def list_admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("👮 **Admins:**\n\n" + "\n".join(lines), parse_mode="Markdown")
 
 
+async def set_support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "ব্যবহার: `/setsupport @reyad0045`", parse_mode="Markdown"
+        )
+        return
+    uname = context.args[0].strip()
+    if not uname.startswith("@"):
+        uname = f"@{uname}"
+    set_setting("support_contact", uname)
+    await update.message.reply_text(
+        f"✅ Support ইউজারনেম সেট হয়েছে: {uname}", parse_mode="Markdown"
+    )
+
+
 async def set_api_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -744,6 +774,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addadmin", add_admin_cmd))
     app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
     app.add_handler(CommandHandler("admins", list_admins_cmd))
+    app.add_handler(CommandHandler("setsupport", set_support_cmd))
     app.add_handler(CommandHandler("setapiurl", set_api_url))
     app.add_handler(CommandHandler("setapikey", set_api_key))
     app.add_handler(CallbackQueryHandler(button_callback))
