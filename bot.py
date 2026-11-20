@@ -191,6 +191,7 @@ def init_db() -> None:
         "bot_name": "RSP OTP BOT",
         "api_url": ENV_API_URL,
         "api_key": ENV_API_KEY,
+        "voltex_rid": "",
         "support_contact": "@reyad0045",
         "support_mode": "LIVE",
         "support_link": "https://t.me/reyad0045",
@@ -735,39 +736,76 @@ def _extract_phone_from_text(text: str) -> str:
     try:
         data = json.loads(text)
         if isinstance(data, dict):
-            for key in ("phone", "number", "phone_number", "mobile", "msisdn"):
-                val = data.get(key)
-                if val:
-                    return str(val).strip()
-            if isinstance(data.get("data"), dict):
-                for key in ("phone", "number", "phone_number", "mobile", "msisdn"):
-                    val = data["data"].get(key)
-                    if val:
-                        return str(val).strip()
+            container = data.get("data") if isinstance(data.get("data"), dict) else data
+            for key in (
+                "full_number",
+                "phone",
+                "number",
+                "phone_number",
+                "mobile",
+                "msisdn",
+                "no_plus_number",
+                "national_number",
+            ):
+                val = container.get(key) if isinstance(container, dict) else None
+                if val is not None and str(val).strip():
+                    s_val = str(val).strip()
+                    if key in ("no_plus_number", "national_number") and not s_val.startswith("+"):
+                        return "+" + s_val
+                    return s_val
     except json.JSONDecodeError:
         pass
     match = re.search(r"\+?\d{8,15}", text)
     return match.group(0) if match else ""
 
 
-def _extract_otp_from_text(text: str) -> str | None:
+def _extract_otp_from_text(text: str, expected_phone: str = "") -> str | None:
     if not text:
         return None
     try:
         data = json.loads(text)
         if isinstance(data, dict):
+            container = data.get("data") if isinstance(data.get("data"), dict) else data
+            otps_list = container.get("otps") if isinstance(container, dict) else None
+            if isinstance(otps_list, list) and otps_list:
+                clean_target = re.sub(r"\D", "", expected_phone or "")
+                chosen_item = None
+                if clean_target:
+                    for item in otps_list:
+                        if isinstance(item, dict):
+                            item_num = re.sub(r"\D", "", str(item.get("number", "")))
+                            if item_num and (
+                                item_num == clean_target
+                                or item_num.endswith(clean_target)
+                                or clean_target.endswith(item_num)
+                            ):
+                                chosen_item = item
+                                break
+                if chosen_item is None:
+                    for item in otps_list:
+                        if isinstance(item, dict) and str(item.get("message", "")).strip():
+                            chosen_item = item
+                            break
+                if isinstance(chosen_item, dict):
+                    msg_val = str(chosen_item.get("message", "")).strip()
+                    code_match = re.search(r"\b\d{4,8}\b", msg_val)
+                    if code_match:
+                        return code_match.group(0)
+                    if msg_val:
+                        return msg_val
+
             for key in ("code", "otp", "sms", "message"):
-                val = data.get(key)
+                val = container.get(key) if isinstance(container, dict) else None
                 if val is not None and str(val).strip():
-                    return str(val).strip()
-            if isinstance(data.get("data"), dict):
-                for key in ("code", "otp", "sms", "message"):
-                    val = data["data"].get(key)
-                    if val is not None and str(val).strip():
-                        return str(val).strip()
+                    s_val = str(val).strip()
+                    m = re.search(r"\b\d{4,8}\b", s_val)
+                    return m.group(0) if m else s_val
     except json.JSONDecodeError:
         pass
     cleaned = text.strip()
+    m = re.search(r"\b\d{4,8}\b", cleaned)
+    if m:
+        return m.group(0)
     if re.fullmatch(r"[A-Za-z0-9\-]{4,10}", cleaned):
         return cleaned
     return None
@@ -806,6 +844,25 @@ def _send_panel_http_request(
         return False, f"Request Error: {str(exc)[:120]}"
 
 
+def _resolve_voltex_rid(country_code: str = "") -> str:
+    countries = get_all_countries()
+    if country_code and country_code in countries:
+        c_info = countries[country_code]
+        dial_digits = re.sub(r"\D", "", str(c_info.get("dial", "")))
+        if dial_digits:
+            specific_rid = get_setting(f"voltex_rid_{country_code}", "")
+            if specific_rid:
+                return specific_rid.strip()
+    configured_rid = get_setting("voltex_rid", "").strip()
+    if configured_rid:
+        return configured_rid
+    if country_code:
+        digits_only = re.sub(r"\D", "", str(country_code))
+        if digits_only:
+            return digits_only
+    return ""
+
+
 def call_custom_panel_get_number(
     panel_row, country_code: str = ""
 ) -> tuple[bool, str, str]:
@@ -813,23 +870,30 @@ def call_custom_panel_get_number(
     if not get_num_url:
         return False, "", "Get Number URL set kora nei."
 
+    rid_val = _resolve_voltex_rid(country_code)
     target_url = (
         get_num_url.replace("{api_key}", api_key or "")
         .replace("{key}", api_key or "")
         .replace("{country}", country_code or "")
+        .replace("{rid}", rid_val or "")
     )
-    payload = {"country": country_code} if country_code else {}
+    payload: dict[str, str] = {}
+    if rid_val:
+        payload["rid"] = rid_val
+    if country_code:
+        payload["country"] = country_code
 
     ok, body = _send_panel_http_request(
         target_url, api_key or "", method="POST", payload=payload
     )
     if not ok:
+        q_params = {}
+        if rid_val:
+            q_params["rid"] = rid_val
+        if country_code:
+            q_params["country"] = country_code
         sep = "&" if "?" in target_url else "?"
-        get_url = (
-            f"{target_url}{sep}{urllib.parse.urlencode({'country': country_code})}"
-            if country_code
-            else target_url
-        )
+        get_url = f"{target_url}{sep}{urllib.parse.urlencode(q_params)}" if q_params else target_url
         ok_get, body_get = _send_panel_http_request(
             get_url, api_key or "", method="GET"
         )
@@ -865,7 +929,7 @@ def fetch_sms_from_custom_panels(phone_number: str, country_code: str) -> str | 
             ok, body = _send_panel_http_request(get_url, api_key or "", method="GET")
 
         if ok:
-            otp = _extract_otp_from_text(body)
+            otp = _extract_otp_from_text(body, expected_phone=phone_number)
             if otp:
                 return otp
     return None
@@ -1034,12 +1098,16 @@ def admin_system_settings_keyboard() -> InlineKeyboardMarkup:
     cd = get_setting("cooldown", "10")
     n_req = get_setting("num_per_req", "3")
     n_shr = get_setting("num_per_share", "1")
+    v_rid = get_setting("voltex_rid", "") or "Auto"
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
                     f"💳 WITHDRAW: {w_stat}", callback_data="adm_tog_withdraw"
-                )
+                ),
+                InlineKeyboardButton(
+                    f"🔢 VOLTEX RID: {v_rid}", callback_data="adm_set_voltex_rid"
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -1279,7 +1347,9 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
             )
     else:
         lines.append("")
-        lines.append("ℹ️ কোনো country যোগ করা হয়নি। অ্যাডমিন `/addcountry` বা Manage Countries থেকে যোগ করতে পারেন।")
+        lines.append(
+            "ℹ️ কোনো country যোগ করা হয়নি। অ্যাডমিন `/addcountry` বা Manage Countries থেকে যোগ করতে পারেন।"
+        )
 
     if unused_rows:
         lines.append("")
@@ -1345,6 +1415,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     bot_name = get_setting("bot_name", "RSP OTP BOT")
     api_url = get_setting("api_url", "")
     api_key = get_setting("api_key", "")
+    voltex_rid = get_setting("voltex_rid", "") or "Auto"
     masked_key = (
         f"{api_key[:4]}***{api_key[-4:]}"
         if len(api_key) >= 8
@@ -1364,6 +1435,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🛠️ **Admin Panel**\n\n"
         f"🤖 **Bot:** {bot_name}\n"
         f"🌍 **Total Countries:** `{len(countries)}`\n"
+        f"🔢 **Voltex RID:** `{voltex_rid}`\n"
         f"🔗 **API URL:** `{api_url if api_url else 'Not Set'}`\n"
         f"🔑 **API Key:** `{masked_key}`\n"
         f"🌐 **Custom Panels:** `{len(list_api_panels())}`\n"
@@ -1652,7 +1724,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.user_data["panel_draft"]["key"] = text
             context.user_data["panel_add_step"] = "num_url"
             await update.message.reply_text(
-                "3️⃣ **Get Number API URL** লিখুন (`{api_key}`, `{country}` ব্যবহার করতে পারেন):",
+                "3️⃣ **Get Number API URL** লিখুন (`{api_key}`, `{country}`, `{rid}` ব্যবহার করতে পারেন):",
                 parse_mode="Markdown",
             )
             return
@@ -1948,9 +2020,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         s_key = data.replace("adm_set_", "", 1)
         context.user_data["awaiting_setting_key"] = s_key
-        await query.message.reply_text(
-            f"✏️ `{s_key}` এর নতুন মান লিখে পাঠান:", parse_mode="Markdown"
-        )
+        if s_key == "voltex_rid":
+            await query.message.reply_text(
+                "🔢 Voltex range ID (`rid`, যেমন `26134`) লিখুন অথবা `clear` লিখুন:",
+                parse_mode="Markdown",
+            )
+        else:
+            await query.message.reply_text(
+                f"✏️ `{s_key}` এর নতুন মান লিখে পাঠান:", parse_mode="Markdown"
+            )
 
     elif data == "adm_add_admin":
         if not is_admin(user.id):
@@ -2471,7 +2549,7 @@ async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
         reward = complete_order_and_reward(
             int(order_id), int(user_id), resolved_code, otp_code
         )
-        if reward > 0:
+        if reward >= 0:
             if resolved_code and resolved_code in countries:
                 c_info = countries[resolved_code]
                 country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
