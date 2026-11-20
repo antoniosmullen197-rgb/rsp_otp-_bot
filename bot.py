@@ -138,11 +138,11 @@ def init_db() -> None:
         "withdraw_methods": "Bkash,Nagad,Binance",
         "auto_range": "ON",
         "text_start": "",
-        "text_get_num": "🟢 **Ready • নিচের অপশন থেকে নম্বর নিন:**",
+        "text_get_num": "🟢 **Ready • Get your number from the options below:**",
         "text_traffic": "📊 **Real-Time Stock & Order Stats:**",
-        "text_refer": "🎁 **রেফার করে আয় করুন!**\nপ্রতি সফল রেফারে পাবেন `৳{refer_reward}`।\n\nআপনার রেফার লিংক:\n`{refer_link}`",
-        "text_withdraw": "💳 **টাকা উত্তোলন (Withdrawal):**\nমিনিমাম উইথড্র: `৳{min_withdraw}`\nআপনার ব্যালেন্স: `৳{balance}`",
-        "text_support": "🎧 **সাপোর্ট সেন্টার:**\nযেকোনো সমস্যায় নিচের অপশন ব্যবহার করুন।",
+        "text_refer": "🎁 **Refer & Earn!**\nEarn `৳{refer_reward}` for every successful referral.\n\nYour referral link:\n`{refer_link}`",
+        "text_withdraw": "💳 **Withdrawal:**\nMinimum withdraw: `৳{min_withdraw}`\nYour balance: `৳{balance}`",
+        "text_support": "🎧 **Support Center:**\nUse the options below for assistance.",
         "last_winner_date": "",
     }
     for key, val in default_settings.items():
@@ -203,7 +203,7 @@ def add_or_update_country(
     clean_code = re.sub(r"[^a-z0-9_]", "", str(country_code or "").strip().lower())
     clean_name = str(name or "").strip()
     if not clean_code or not clean_name:
-        return False, "সঠিক Country Code এবং Country Name দিন।"
+        return False, "Please provide a valid Country Code and Country Name."
 
     clean_dial = str(dial or "+1").strip()
     if not clean_dial.startswith("+"):
@@ -428,7 +428,7 @@ def set_user_country(user_id: int, country_code: str) -> None:
 
 
 def create_active_order(user_id: int, country_code: str, phone_number: str) -> int:
-    code = resolve_country_code(country_code) or "custom"
+    code = resolve_country_code(country_code) or "auto"
     order_id = get_next_sequence("orders")
     db = get_db()
     db.orders.insert_one(
@@ -842,7 +842,7 @@ def call_custom_panel_get_number(
 ) -> tuple[bool, dict, str]:
     _, _, api_key, get_num_url, _, _ = panel_row
     if not get_num_url:
-        return False, {}, "Get Number URL set kora nei."
+        return False, {}, "Get Number URL is not configured."
 
     rid_val = _resolve_voltex_rid(country_code)
     target_url = (
@@ -883,7 +883,7 @@ def call_custom_panel_get_number(
     details = _parse_panel_number_details(body)
     if details.get("phone"):
         return True, details, body[:200]
-    return False, {}, body[:200] if body else "Panel theke number pawa jayni."
+    return False, {}, body[:200] if body else "No number received from panel."
 
 
 def fetch_sms_from_custom_panels(phone_number: str, country_code: str) -> str | None:
@@ -953,6 +953,89 @@ def call_voltex_api(extra_params: dict):
 
 def fetch_panel_traffic():
     return call_voltex_api({"action": "traffic"})
+
+
+def _extract_sorted_voltex_traffic(panel_data) -> list[tuple[str, int]]:
+    items: list[tuple[str, int]] = []
+    if not panel_data:
+        return items
+
+    source = (
+        panel_data.get("data")
+        if isinstance(panel_data, dict)
+        and isinstance(panel_data.get("data"), (dict, list))
+        else panel_data
+    )
+
+    def _to_int(val) -> int:
+        try:
+            if isinstance(val, bool):
+                return 0
+            return int(float(str(val).strip()))
+        except Exception:
+            return 0
+
+    if isinstance(source, dict):
+        for key, val in source.items():
+            if str(key).lower() in (
+                "status",
+                "msg",
+                "message",
+                "success",
+                "error",
+                "raw_preview",
+            ):
+                continue
+            if isinstance(val, dict):
+                cnt = 0
+                for k in (
+                    "count",
+                    "traffic",
+                    "available",
+                    "stock",
+                    "numbers",
+                    "total",
+                    "otp",
+                ):
+                    if k in val and val[k] is not None:
+                        cnt = _to_int(val[k])
+                        break
+                label = str(val.get("country") or val.get("name") or key).strip()
+                items.append((label, cnt))
+            elif isinstance(val, (int, float, str)):
+                cnt = _to_int(val)
+                if cnt > 0 or str(key).strip():
+                    items.append((str(key).strip(), cnt))
+
+    elif isinstance(source, list):
+        for row in source:
+            if not isinstance(row, dict):
+                continue
+            label = str(
+                row.get("country")
+                or row.get("country_name")
+                or row.get("range")
+                or row.get("name")
+                or row.get("code")
+                or "Unknown"
+            ).strip()
+            cnt = 0
+            for k in (
+                "count",
+                "traffic",
+                "available",
+                "stock",
+                "numbers",
+                "total",
+                "otp",
+            ):
+                if k in row and row[k] is not None:
+                    cnt = _to_int(row[k])
+                    break
+            items.append((label, cnt))
+
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items
 
 
 def fetch_sms_from_panel(phone_number: str, country_code: str):
@@ -1172,7 +1255,7 @@ def number_card_keyboard(country_code: str) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"☎️ {pname} (Panel API)", callback_data=f"pickpanel_{pid}"
+                    f"☎️ {pname} (Auto Country)", callback_data=f"pickpanel_{pid}"
                 )
             ]
         )
@@ -1209,17 +1292,15 @@ def order_action_keyboard(order_id: int, phone_number: str) -> InlineKeyboardMar
 
 def countries_keyboard() -> InlineKeyboardMarkup:
     countries = get_all_countries()
-    rows = []
+    buttons = []
     for code, info in countries.items():
-        rate = get_country_rate(code)
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    f"☎️ {info['flag']} {info['name']} ({info['dial']}) — ৳{rate:.2f}",
-                    callback_data=f"setcountry_{code}",
-                )
-            ]
+        buttons.append(
+            InlineKeyboardButton(
+                f"{info['flag']} {info['name'].upper()}",
+                callback_data=f"setcountry_{code}",
+            )
         )
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(rows)
 
 
@@ -1268,6 +1349,88 @@ def _format_roxy_order_card(
     )
 
 
+async def get_auto_country_voltex_number(
+    chat_id: int,
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    panels = list_api_panels()
+    if not panels:
+        await send_number_card(chat_id, user_id, context)
+        return
+
+    countries = get_all_countries()
+    default_service = get_setting("default_service", "Facebook") or "Facebook"
+    now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
+    _, _, active_code = get_user_profile(user_id)
+
+    panel_data, _ = await asyncio.to_thread(fetch_panel_traffic)
+    sorted_traffic = _extract_sorted_voltex_traffic(panel_data)
+    top_hint = sorted_traffic[0][0] if sorted_traffic else active_code
+
+    last_error = ""
+    for panel in panels:
+        pid, pname, _, _, _, status = panel
+        if str(status).upper() != "ACTIVE":
+            continue
+
+        ok, details, resp_text = await asyncio.to_thread(
+            call_custom_panel_get_number, panel, top_hint
+        )
+        phone_num = (details or {}).get("phone", "").strip()
+        if not ok or not phone_num:
+            last_error = f"{pname}: {resp_text}"
+            continue
+
+        raw_api_country = (details or {}).get("country", "").strip()
+        detected_code = resolve_country_code(
+            raw_api_country
+            or (phone_num if phone_num.startswith("+") else top_hint)
+        )
+
+        if detected_code and detected_code in countries:
+            c_info = countries[detected_code]
+            country_display = f"{c_info['name']} (Auto)"
+            flag_display = c_info.get("flag", "🌍")
+            service_display = (
+                c_info.get("service")
+                or (details or {}).get("service")
+                or default_service
+            )
+            set_user_country(user_id, detected_code)
+        else:
+            rid_val = get_setting("voltex_rid", "").strip()
+            base_name = raw_api_country or (f"Range {rid_val}" if rid_val else pname)
+            country_display = f"{base_name} (Auto)"
+            flag_display = "🌍"
+            service_display = (details or {}).get("service") or default_service
+
+        rate = get_country_rate(detected_code)
+        order_id = create_active_order(user_id, detected_code or "auto", phone_num)
+        card_text = _format_roxy_order_card(
+            country_label=country_display,
+            flag=flag_display,
+            service_name=service_display,
+            refreshed_str=now_str,
+            order_id=order_id,
+            phone_number=phone_num,
+            rate=rate,
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=card_text,
+            parse_mode="Markdown",
+            reply_markup=order_action_keyboard(order_id, phone_num),
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"❌ Could not fetch an Auto Country number from Voltex panel.\n`{last_error or 'No active panel response'}`",
+        parse_mode="Markdown",
+    )
+
+
 async def send_number_card(
     chat_id: int,
     user_id: int,
@@ -1290,19 +1453,19 @@ async def send_number_card(
     active_note = ""
     if active_orders:
         active_items = [
-            f"☎️ `{ph}` • `#{oid}` ({resolve_country_code(cc).upper() or 'CUSTOM'})"
+            f"☎️ `{ph}` • `#{oid}` ({resolve_country_code(cc).upper() or 'AUTO'})"
             for oid, cc, ph, _ in active_orders[:3]
         ]
         active_note = "\n\n⏳ **Active Numbers:**\n" + "\n".join(active_items)
 
     custom_header = get_setting("text_get_num", "")
     if not stock_rows and not panels:
-        body_note = "⚠️ **No Stock / Panel:** বর্তমানে কোনো নম্বর বা প্যানেল যুক্ত নেই।"
+        body_note = "⚠️ **No Stock / Panel:** No numbers or panels are configured yet."
     else:
         body_note = (
             custom_header
             if custom_header
-            else "🟢 **Ready • নিচের অপশন থেকে নম্বর নিন:**"
+            else "🟢 **Ready • Get your number from the options below:**"
         )
 
     if code and code in countries:
@@ -1316,7 +1479,7 @@ async def send_number_card(
         )
     else:
         rid_val = get_setting("voltex_rid", "").strip()
-        c_title = f"Range {rid_val}" if rid_val else "Select Country"
+        c_title = f"Range {rid_val}" if rid_val else "Auto Country"
         header_block = _format_number_card_header(
             country_label=c_title,
             flag="🌍",
@@ -1339,7 +1502,8 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     api_key = get_setting("api_key", "")
     now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
 
-    panel_data, status_label = fetch_panel_traffic()
+    panel_data, status_label = await asyncio.to_thread(fetch_panel_traffic)
+    sorted_traffic = _extract_sorted_voltex_traffic(panel_data)
     completed_counts = get_real_completed_order_counts()
     custom_traffic_hdr = get_setting(
         "text_traffic", "📊 **Real-Time Stock & Order Stats**"
@@ -1354,12 +1518,26 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     lines = [
         custom_traffic_hdr,
         "━━━━━━━━━━━━━━━━━━━━━━",
-        f"📦 **Unused Stock:** `{unused_total}` • **Used:** `{used_total}` • **Panels:** `{custom_panels_cnt}`",
-        f"🔗 **API URL:** `{api_url if api_url else 'Not Set'}`",
-        f"🔑 **API Key:** `{'Set' if api_key else 'Not Set'}`",
-        f"📡 **API Status:** `{status_label}`",
-        f"🔄 **Refreshed:** `{now_str}`",
     ]
+
+    if sorted_traffic:
+        top_label, top_cnt = sorted_traffic[0]
+        lines.append(f"🔥 **Highest Voltex Traffic:** `{top_label}` — **{top_cnt}**")
+        lines.append("**Top Voltex Traffic Ranges/Countries:**")
+        for idx, (t_label, t_cnt) in enumerate(sorted_traffic[:8], start=1):
+            badge = "🔥" if idx == 1 else "•"
+            lines.append(f"{badge} `{t_label}`: `{t_cnt}`")
+        lines.append("")
+
+    lines.extend(
+        [
+            f"📦 **Unused Stock:** `{unused_total}` • **Used:** `{used_total}` • **Panels:** `{custom_panels_cnt}`",
+            f"🔗 **API URL:** `{api_url if api_url else 'Not Set'}`",
+            f"🔑 **API Key:** `{'Set' if api_key else 'Not Set'}`",
+            f"📡 **API Status:** `{status_label}`",
+            f"🔄 **Refreshed:** `{now_str}`",
+        ]
+    )
 
     if countries:
         lines.append("")
@@ -1384,7 +1562,7 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         lines.append("")
         lines.append(
-            "ℹ️ কোনো country যোগ করা হয়নি। অ্যাডমিন `/addcountry` বা Manage Countries থেকে যোগ করতে পারেন।"
+            "ℹ️ No countries added yet. Admins can add via `/addcountry` or Manage Countries."
         )
 
     if unused_rows:
@@ -1515,7 +1693,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         try:
             await context.bot.send_message(
                 chat_id=ref_id,
-                text=f"🎉 নতুন রেফার সফল হয়েছে! আপনার ব্যালেন্সে `৳{ref_bonus:.2f}` যোগ হয়েছে।",
+                text=f"🎉 New referral completed! `৳{ref_bonus:.2f}` has been added to your balance.",
                 parse_mode="Markdown",
             )
         except Exception:
@@ -1534,7 +1712,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             c_info = countries[country_code]
             c_line = f"🌍 **Selected Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)"
         else:
-            c_line = "🌍 **Selected Country:** Not Added Yet"
+            c_line = "🌍 **Mode:** Auto Country (Voltex)"
         welcome_text = (
             f"👋 Welcome to **{bot_name}**!\n\n"
             f"📩 **OTPs:** `{otp_count}` • 💰 **Balance:** `৳{balance:.2f}`\n"
@@ -1564,7 +1742,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         raw_lines = file_bytes.decode("utf-8", errors="ignore").splitlines()
         added = upload_manual_numbers(country_target, raw_lines)
         await update.message.reply_text(
-            f"✅ **{country_target}** এর জন্য `{added}` টি নতুন নম্বর ফাইল থেকে স্টকে যুক্ত হয়েছে।",
+            f"✅ Added `{added}` new numbers to stock for **{country_target}**.",
             parse_mode="Markdown",
         )
 
@@ -1595,7 +1773,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     text=f"🎧 **Admin Reply:**\n\n{text}",
                     parse_mode="Markdown",
                 )
-                await update.message.reply_text("✅ ইউজারকে রিপ্লাই পাঠানো হয়েছে।")
+                await update.message.reply_text("✅ Reply sent to the user.")
                 return
             except Exception:
                 pass
@@ -1606,27 +1784,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             cleaned_code = re.sub(r"[^a-z0-9_]", "", text.lower())
             if not cleaned_code:
                 await update.message.reply_text(
-                    "⚠️ সঠিক short code দিন (যেমন: `be`, `de`, `ca`):"
+                    "⚠️ Enter a valid short code (e.g., `be`, `de`, `ca`):"
                 )
                 return
             context.user_data["country_draft"] = {"code": cleaned_code}
             context.user_data["country_add_step"] = "name"
             await update.message.reply_text(
-                "2️⃣ দেশের নাম লিখুন (যেমন: `Belgium`):", parse_mode="Markdown"
+                "2️⃣ Enter country name (e.g., `Belgium`):", parse_mode="Markdown"
             )
             return
         elif country_step == "name":
             context.user_data["country_draft"]["name"] = text
             context.user_data["country_add_step"] = "dial"
             await update.message.reply_text(
-                "3️⃣ Dial Code লিখুন (যেমন: `+32`):", parse_mode="Markdown"
+                "3️⃣ Enter dial code (e.g., `+32`):", parse_mode="Markdown"
             )
             return
         elif country_step == "dial":
             context.user_data["country_draft"]["dial"] = text
             context.user_data["country_add_step"] = "rate"
             await update.message.reply_text(
-                "4️⃣ প্রতি OTP-তে কত টাকা (৳) দিবেন? সংখ্যা লিখুন (যেমন: `18.00`):",
+                "4️⃣ Enter rate per OTP in `৳` (e.g., `18.00`):",
                 parse_mode="Markdown",
             )
             return
@@ -1636,12 +1814,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 if rate_val < 0:
                     raise ValueError()
             except ValueError:
-                await update.message.reply_text("⚠️ সঠিক rate লিখুন (যেমন: `18.00`):")
+                await update.message.reply_text("⚠️ Enter a valid rate (e.g., `18.00`):")
                 return
             context.user_data["country_draft"]["rate"] = rate_val
             context.user_data["country_add_step"] = "flag_service"
             await update.message.reply_text(
-                "5️⃣ Flag এবং Service লিখুন (যেমন: `🇧🇪 Facebook` অথবা `skip` লিখুন):",
+                "5️⃣ Enter Flag and Service (e.g., `🇧🇪 Facebook` or type `skip`):",
                 parse_mode="Markdown",
             )
             return
@@ -1670,7 +1848,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             if ok:
                 await update.message.reply_text(
-                    f"🎉 **{draft.get('name')}** (`{res}`) সফলভাবে যুক্ত হয়েছে! Service: `{service_val}` • Rate: `৳{float(draft.get('rate', 15.0)):.2f}`",
+                    f"🎉 **{draft.get('name')}** (`{res}`) added! Service: `{service_val}` • Rate: `৳{float(draft.get('rate', 15.0)):.2f}`",
                     parse_mode="Markdown",
                 )
             else:
@@ -1694,7 +1872,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except ValueError:
                 context.user_data["awaiting_rate_country"] = target_code
                 await update.message.reply_text(
-                    "⚠️ Invalid amount. Shudhu number likhun (e.g. `18.50`).",
+                    "⚠️ Invalid amount. Enter numbers only (e.g., `18.50`).",
                     parse_mode="Markdown",
                 )
                 return
@@ -1704,7 +1882,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             val_to_save = "" if text.lower() == "clear" else text
             set_setting(s_key, val_to_save)
             await update.message.reply_text(
-                f"✅ `{s_key}` আপডেট হয়ে `{val_to_save or '(empty)'}` সেট হয়েছে।",
+                f"✅ `{s_key}` updated to `{val_to_save or '(empty)'}`.",
                 parse_mode="Markdown",
             )
             return
@@ -1714,18 +1892,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if text.isdigit():
                 add_admin_id(int(text))
                 await update.message.reply_text(
-                    f"✅ `{text}` কে নতুন অ্যাডমিন করা হয়েছে।",
+                    f"✅ `{text}` has been added as an admin.",
                     parse_mode="Markdown",
                 )
             else:
-                await update.message.reply_text("⚠️ সঠিক numeric User ID দিন।")
+                await update.message.reply_text("⚠️ Enter a valid numeric User ID.")
             return
 
         if context.user_data.get("awaiting_broadcast"):
             context.user_data.pop("awaiting_broadcast")
             sent = await broadcast_message(context, f"📢 **Notice:**\n\n{text}")
             await update.message.reply_text(
-                f"✅ `{sent}` জন ইউজারকে ব্রডকাস্ট মেসেজ পাঠানো হয়েছে।",
+                f"✅ Broadcast message sent to `{sent}` users.",
                 parse_mode="Markdown",
             )
             return
@@ -1735,7 +1913,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             c_name = text.strip() or "General"
             context.user_data["awaiting_upload_numbers_for"] = c_name
             await update.message.reply_text(
-                f"📥 **{c_name}** এর নম্বরগুলো নিচে পেস্ট করুন (প্রতি লাইনে একটি নম্বর) অথবা `.txt` ফাইল পাঠান:",
+                f"📥 Paste numbers for **{c_name}** (one per line) or send a `.txt` file:",
                 parse_mode="Markdown",
             )
             return
@@ -1744,7 +1922,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             c_name = context.user_data.pop("awaiting_upload_numbers_for")
             added = upload_manual_numbers(c_name, text.splitlines())
             await update.message.reply_text(
-                f"✅ **{c_name}** এর জন্য `{added}` টি নতুন নম্বর স্টকে যুক্ত হয়েছে।",
+                f"✅ Added `{added}` new numbers to stock for **{c_name}**.",
                 parse_mode="Markdown",
             )
             return
@@ -1754,14 +1932,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.user_data["panel_draft"] = {"name": text}
             context.user_data["panel_add_step"] = "key"
             await update.message.reply_text(
-                "2️⃣ প্যানেলের **API Key** লিখুন:", parse_mode="Markdown"
+                "2️⃣ Enter the panel **API Key**:", parse_mode="Markdown"
             )
             return
         elif panel_step == "key":
             context.user_data["panel_draft"]["key"] = text
             context.user_data["panel_add_step"] = "num_url"
             await update.message.reply_text(
-                "3️⃣ **Get Number API URL** লিখুন (`{api_key}`, `{country}`, `{rid}` ব্যবহার করতে পারেন):",
+                "3️⃣ Enter **Get Number API URL** (supports `{api_key}`, `{country}`, `{rid}`):",
                 parse_mode="Markdown",
             )
             return
@@ -1769,7 +1947,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.user_data["panel_draft"]["num_url"] = text
             context.user_data["panel_add_step"] = "otp_url"
             await update.message.reply_text(
-                "4️⃣ **Get OTP URL** লিখুন (`{phone}`, `{country}`, `{api_key}` ব্যবহার করতে পারেন) অথবা `skip` লিখুন:",
+                "4️⃣ Enter **Get OTP URL** (supports `{phone}`, `{country}`, `{api_key}`) or type `skip`:",
                 parse_mode="Markdown",
             )
             return
@@ -1778,13 +1956,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.user_data.pop("panel_add_step", None)
             otp_url = "" if text.lower() == "skip" else text
             add_api_panel(
-                draft.get("name", "Custom Panel"),
+                draft.get("name", "Voltex"),
                 draft.get("key", ""),
                 draft.get("num_url", ""),
                 otp_url,
             )
             await update.message.reply_text(
-                f"🎉 **{draft.get('name', 'Custom Panel')}** প্যানেলটি যুক্ত হয়েছে!",
+                f"🎉 Panel **{draft.get('name', 'Voltex')}** added successfully!",
                 parse_mode="Markdown",
             )
             return
@@ -1793,10 +1971,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         method = context.user_data.pop("awaiting_wd_method")
         bal = deduct_all_user_balance(user.id)
         if bal <= 0:
-            await update.message.reply_text("⚠️ আপনার অ্যাকাউন্টে ব্যালেন্স নেই।")
+            await update.message.reply_text("⚠️ You have no balance available to withdraw.")
             return
         await update.message.reply_text(
-            "✅ আপনার উইথড্র রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে।"
+            "✅ Your withdrawal request has been sent to the admin."
         )
         for aid in get_all_admin_ids():
             try:
@@ -1825,19 +2003,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         f"📩 **Live Support Message**\n"
                         f"User ID: `{user.id}` (@{user.username or 'N/A'})\n\n"
                         f"💬 {text}\n\n"
-                        f"*রিপ্লাই দিতে এই মেসেজটি Reply করে লিখুন।*"
+                        f"*Reply directly to this message to respond.*"
                     ),
                     parse_mode="Markdown",
                 )
             except Exception:
                 pass
         await update.message.reply_text(
-            "✅ আপনার মেসেজ সাপোর্ট টিমের কাছে পাঠানো হয়েছে।"
+            "✅ Your message has been sent to the support team."
         )
         return
 
     if text in ("Get Number", "🟢 নম্বর নিন", "📱 নম্বর নিন"):
-        await send_number_card(update.effective_chat.id, user.id, context)
+        if list_api_panels():
+            await get_auto_country_voltex_number(
+                update.effective_chat.id, user.id, context
+            )
+        else:
+            await send_number_card(update.effective_chat.id, user.id, context)
     elif text in ("Live Traffic", "🔵 স্টক দেখুন", "📦 স্টক দেখুন"):
         await send_live_traffic(update.effective_chat.id, context)
     elif text in ("Wallet", "🟡 ব্যালেন্স", "💰 ব্যালেন্স"):
@@ -1862,7 +2045,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     elif text in ("Withdraw", "💳 WITHDRAWAL"):
         if get_setting("withdraw_status", "ON") != "ON":
-            await update.message.reply_text("⚠️ বর্তমানে উইথড্র সাময়িকভাবে বন্ধ আছে।")
+            await update.message.reply_text("⚠️ Withdrawals are temporarily disabled.")
             return
         balance, _, _ = get_user_profile(user.id)
         min_w = float(get_setting("min_withdraw", "50.0") or 50.0)
@@ -1873,7 +2056,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         msg_txt = tpl.format(min_withdraw=f"{min_w:.2f}", balance=f"{balance:.2f}")
         if balance < min_w:
             await update.message.reply_text(
-                f"{msg_txt}\n\n❌ আপনার পর্যাপ্ত ব্যালেন্স নেই।",
+                f"{msg_txt}\n\n❌ Insufficient balance for withdrawal.",
                 parse_mode="Markdown",
             )
             return
@@ -1889,7 +2072,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ]
         )
         await update.message.reply_text(
-            f"{msg_txt}\n\nপেমেন্ট মেথড সিলেক্ট করুন:",
+            f"{msg_txt}\n\nSelect a payment method:",
             parse_mode="Markdown",
             reply_markup=kb,
         )
@@ -1928,7 +2111,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if mode == "LIVE" and not buttons:
             context.user_data["in_live_support"] = True
             await update.message.reply_text(
-                "💬 **Live Chat চালু হয়েছে!** আপনার সমস্যা লিখে পাঠান:",
+                "💬 **Live Chat started!** Type your message below:",
                 parse_mode="Markdown",
             )
             return
@@ -1963,7 +2146,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "user_live_chat":
         context.user_data["in_live_support"] = True
         await query.message.reply_text(
-            "💬 **Live Chat চালু হয়েছে!** আপনার মেসেজ লিখে পাঠান:",
+            "💬 **Live Chat started!** Type your message below:",
             parse_mode="Markdown",
         )
         return
@@ -1972,7 +2155,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         method = data.replace("wdmeth_", "", 1)
         context.user_data["awaiting_wd_method"] = method
         await query.message.reply_text(
-            f"📝 আপনার **{method}** অ্যাকাউন্ট নম্বর ও পরিমাণ লিখে পাঠান:",
+            f"📝 Enter your **{method}** account details and amount:",
             parse_mode="Markdown",
         )
         return
@@ -1981,7 +2164,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not is_admin(user.id):
             return
         await query.message.reply_text(
-            "🌍 **Manage Countries** (নতুন দেশ যোগ করতে নিচের বাটনে চাপ দিন):",
+            "🌍 **Manage Countries** (Tap below to add a new country):",
             parse_mode="Markdown",
             reply_markup=admin_manage_countries_keyboard(),
         )
@@ -1991,7 +2174,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         context.user_data["country_add_step"] = "code"
         await query.message.reply_text(
-            "1️⃣ দেশের short code লিখুন (যেমন: `be`, `de`, `ca`, `fr`):",
+            "1️⃣ Enter country short code (e.g., `be`, `de`, `ca`, `fr`):",
             parse_mode="Markdown",
         )
 
@@ -2001,16 +2184,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         c_code = data.replace("del_country_", "", 1)
         if delete_custom_country(c_code):
             await query.message.reply_text(
-                f"✅ `{c_code}` দেশটি ডিলিট করা হয়েছে।", parse_mode="Markdown"
+                f"✅ Country `{c_code}` has been deleted.", parse_mode="Markdown"
             )
         else:
-            await query.message.reply_text("⚠️ ডিফল্ট দেশ ডিলিট করা যাবে না।")
+            await query.message.reply_text("⚠️ Default countries cannot be deleted.")
 
     elif data == "admin_rates_menu":
         if not is_admin(user.id):
             return
         if not countries:
-            await query.message.reply_text("⚠️ এখনো কোনো country যোগ করা হয়নি।")
+            await query.message.reply_text("⚠️ No countries added yet.")
             return
         await query.message.reply_text(
             "💵 **Select a country to set rate (৳):**",
@@ -2028,7 +2211,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             curr = get_country_rate(c_code)
             await query.message.reply_text(
                 f"💵 {info['flag']} **{info['name']}** (`{c_code}`) current rate: `৳{curr:.2f}`\n"
-                f"Notun rate (e.g. `17.50`) type kore send korun:",
+                f"Type the new rate (e.g., `17.50`) and send:",
                 parse_mode="Markdown",
             )
 
@@ -2057,29 +2240,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["awaiting_setting_key"] = s_key
         if s_key == "voltex_rid":
             await query.message.reply_text(
-                "🔢 Voltex range ID (`rid`, যেমন `2246566`) লিখুন অথবা `clear` লিখুন:",
+                "🔢 Enter Voltex range ID (`rid`, e.g., `2246566`) or type `clear`:",
                 parse_mode="Markdown",
             )
         elif s_key == "default_service":
             await query.message.reply_text(
-                "📱 Service নাম লিখুন (যেমন: `Facebook`):",
+                "📱 Enter Service name (e.g., `Facebook`):",
                 parse_mode="Markdown",
             )
         elif s_key == "otp_group_link":
             await query.message.reply_text(
-                "💬 OTP Group link লিখুন (`https://t.me/...`) অথবা `clear` লিখুন:",
+                "💬 Enter OTP Group link (`https://t.me/...`) or type `clear`:",
                 parse_mode="Markdown",
             )
         else:
             await query.message.reply_text(
-                f"✏️ `{s_key}` এর নতুন মান লিখে পাঠান:", parse_mode="Markdown"
+                f"✏️ Enter new value for `{s_key}`:", parse_mode="Markdown"
             )
 
     elif data == "adm_add_admin":
         if not is_admin(user.id):
             return
         context.user_data["awaiting_new_admin"] = True
-        await query.message.reply_text("👤 নতুন অ্যাডমিনের Numeric User ID পাঠান:")
+        await query.message.reply_text("👤 Send the numeric User ID of the new admin:")
 
     elif data == "admin_api_panels":
         if not is_admin(user.id):
@@ -2111,7 +2294,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         context.user_data["panel_add_step"] = "name"
         await query.message.reply_text(
-            "1️⃣ প্যানেলের নাম লিখুন (যেমন: `Voltex` বা `5sim`):", parse_mode="Markdown"
+            "1️⃣ Enter panel name (e.g., `Voltex` or `5sim`):", parse_mode="Markdown"
         )
 
     elif data.startswith("panel_del_"):
@@ -2119,7 +2302,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         pid = int(data.replace("panel_del_", "", 1))
         delete_api_panel(pid)
-        await query.message.reply_text("✅ প্যানেলটি ডিলিট করা হয়েছে।")
+        await query.message.reply_text("✅ Panel deleted.")
 
     elif data == "admin_stock_menu":
         if not is_admin(user.id):
@@ -2153,14 +2336,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         context.user_data["awaiting_upload_country"] = True
         await query.message.reply_text(
-            "🌍 কোন দেশের নম্বর আপলোড করবেন? দেশের নাম লিখুন:"
+            "🌍 Enter the country name for uploading numbers:"
         )
 
     elif data == "stock_clear_all":
         if not is_admin(user.id):
             return
         clear_all_manual_numbers()
-        await query.message.reply_text("🗑 সব ম্যানুয়াল নম্বর স্টক মুছে ফেলা হয়েছে।")
+        await query.message.reply_text("🗑 All manual number stock has been cleared.")
 
     elif data == "admin_support_menu":
         if not is_admin(user.id):
@@ -2242,7 +2425,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ]
         )
         await query.message.reply_text(
-            "🎨 **Edit Bot Texts** (খালি রাখতে `clear` লিখুন):",
+            "🎨 **Edit Bot Texts** (type `clear` to reset):",
             parse_mode="Markdown",
             reply_markup=kb,
         )
@@ -2251,7 +2434,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not is_admin(user.id):
             return
         context.user_data["awaiting_broadcast"] = True
-        await query.message.reply_text("📢 সব ইউজারকে পাঠানোর মেসেজটি লিখুন:")
+        await query.message.reply_text("📢 Type the broadcast message for all users:")
 
     elif data == "admin_announce_winner":
         if not is_admin(user.id):
@@ -2263,7 +2446,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         c_name = data.replace("pickstock_", "", 1)
         picked = pick_manual_number(c_name, user.id)
         if not picked:
-            await query.message.reply_text("❌ এই স্টকের নম্বর শেষ হয়ে গেছে।")
+            await query.message.reply_text("❌ Out of stock for this selection.")
             return
         _, phone_num = picked
         matched_code = resolve_country_code(c_name)
@@ -2298,10 +2481,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pid = int(data.replace("pickpanel_", "", 1))
         panel = get_api_panel(pid)
         if not panel:
-            await query.message.reply_text("❌ Panel পাওয়া যায়নি।")
+            await query.message.reply_text("❌ Panel not found.")
             return
+        panel_data, _ = await asyncio.to_thread(fetch_panel_traffic)
+        sorted_traffic = _extract_sorted_voltex_traffic(panel_data)
         _, _, active_code = get_user_profile(user.id)
-        ok, details, resp_text = call_custom_panel_get_number(panel, active_code)
+        hint_code = sorted_traffic[0][0] if sorted_traffic else active_code
+
+        ok, details, resp_text = await asyncio.to_thread(
+            call_custom_panel_get_number, panel, hint_code
+        )
         phone_num = details.get("phone", "")
         if not ok or not phone_num:
             await query.message.reply_text(
@@ -2312,22 +2501,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         raw_api_country = details.get("country", "")
         detected_code = resolve_country_code(
-            raw_api_country or (phone_num if phone_num.startswith("+") else active_code)
+            raw_api_country or (phone_num if phone_num.startswith("+") else hint_code)
         )
         if detected_code and detected_code in countries:
             c_info = countries[detected_code]
-            country_display = f"{c_info['name']} MIX Number"
+            country_display = f"{c_info['name']} (Auto)"
             flag_display = c_info["flag"]
-            service_display = c_info.get("service") or details.get("service") or default_service
+            service_display = (
+                c_info.get("service") or details.get("service") or default_service
+            )
+            set_user_country(user.id, detected_code)
         else:
             rid_val = get_setting("voltex_rid", "").strip()
             base_c = raw_api_country or (f"Range {rid_val}" if rid_val else panel[1])
-            country_display = f"{base_c} MIX Number"
+            country_display = f"{base_c} (Auto)"
             flag_display = "🌍"
             service_display = details.get("service") or default_service
 
         rate = get_country_rate(detected_code)
-        order_id = create_active_order(user.id, detected_code, phone_num)
+        order_id = create_active_order(user.id, detected_code or "auto", phone_num)
         card_text = _format_roxy_order_card(
             country_label=country_display,
             flag=flag_display,
@@ -2351,7 +2543,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         db = get_db()
         order_doc = db.orders.find_one({"id": oid, "user_id": int(user.id)})
         if not order_doc:
-            await query.message.reply_text("❌ Order পাওয়া যায়নি।")
+            await query.message.reply_text("❌ Order not found.")
             return
 
         if order_doc.get("status") == "COMPLETED" and order_doc.get("otp_code"):
@@ -2377,20 +2569,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         else:
             await query.message.reply_text(
-                f"⏳ `{phone_num}` (`#{oid}`) এর জন্য এখনো OTP আসেনি। একটু পর আবার চেষ্টা করুন।",
+                f"⏳ No OTP received yet for `{phone_num}` (`#{oid}`). Please try again shortly.",
                 parse_mode="Markdown",
             )
 
     elif data.startswith("change_"):
-        raw_c = data.replace("change_", "", 1)
-        c_code = "" if raw_c == "none" else resolve_country_code(raw_c)
-        await send_number_card(
-            query.message.chat_id, user.id, context, country_code=c_code
-        )
+        if list_api_panels():
+            await get_auto_country_voltex_number(
+                query.message.chat_id, user.id, context
+            )
+        else:
+            raw_c = data.replace("change_", "", 1)
+            c_code = "" if raw_c == "none" else resolve_country_code(raw_c)
+            await send_number_card(
+                query.message.chat_id, user.id, context, country_code=c_code
+            )
 
     elif data == "countries_menu":
         if not countries:
-            await query.message.reply_text("⚠️ এখনো কোনো country যোগ করা হয়নি।")
+            await query.message.reply_text("⚠️ No countries added yet.")
             return
         await query.message.reply_text(
             "🌍 **Select Country & Dial Code:**",
@@ -2435,7 +2632,7 @@ async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not doc:
         await update.message.reply_text(
-            f"❌ Order `#{order_id}` পাওয়া যায়নি।", parse_mode="Markdown"
+            f"❌ Order `#{order_id}` not found.", parse_mode="Markdown"
         )
         return
 
@@ -2446,7 +2643,7 @@ async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if status != "ACTIVE":
         await update.message.reply_text(
-            f"⚠️ Order `#{order_id}` already `{status}`.", parse_mode="Markdown"
+            f"⚠️ Order `#{order_id}` is already `{status}`.", parse_mode="Markdown"
         )
         return
 
@@ -2472,12 +2669,12 @@ async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode="Markdown",
         )
         await update.message.reply_text(
-            f"✅ Order `#{order_id}` (`{phone_number}`)-এ OTP `{otp_code}` পাঠানো হয়েছে (`+৳{reward:.2f}`)।",
+            f"✅ OTP `{otp_code}` sent for Order `#{order_id}` (`{phone_number}`) (`+৳{reward:.2f}`).",
             parse_mode="Markdown",
         )
     except Exception as exc:
         await update.message.reply_text(
-            f"⚠️ মেসেজ পাঠাতে সমস্যা: `{exc}`", parse_mode="Markdown"
+            f"⚠️ Failed to send message: `{exc}`", parse_mode="Markdown"
         )
 
 
