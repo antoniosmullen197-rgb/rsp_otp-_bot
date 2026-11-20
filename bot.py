@@ -120,11 +120,12 @@ def init_db() -> None:
         )
 
     default_settings = {
-        "bot_name": "RSP OTP BOT",
+        "bot_name": "RSP SMS",
         "api_url": ENV_API_URL,
         "api_key": ENV_API_KEY,
         "voltex_rid": "",
         "default_service": "Facebook",
+        "otp_group_link": "https://t.me/reyad0045",
         "support_contact": "@reyad0045",
         "support_mode": "LIVE",
         "support_link": "https://t.me/reyad0045",
@@ -137,8 +138,8 @@ def init_db() -> None:
         "withdraw_methods": "Bkash,Nagad,Binance",
         "auto_range": "ON",
         "text_start": "",
-        "text_get_num": "📱 **স্টক বা প্যানেল থেকে নম্বর সিলেক্ট করুন:**",
-        "text_traffic": "📊 **রিয়েল-টাইম স্টক ও অর্ডার স্ট্যাটাস:**",
+        "text_get_num": "🟢 **Ready • নিচের অপশন থেকে নম্বর নিন:**",
+        "text_traffic": "📊 **Real-Time Stock & Order Stats:**",
         "text_refer": "🎁 **রেফার করে আয় করুন!**\nপ্রতি সফল রেফারে পাবেন `৳{refer_reward}`।\n\nআপনার রেফার লিংক:\n`{refer_link}`",
         "text_withdraw": "💳 **টাকা উত্তোলন (Withdrawal):**\nমিনিমাম উইথড্র: `৳{min_withdraw}`\nআপনার ব্যালেন্স: `৳{balance}`",
         "text_support": "🎧 **সাপোর্ট সেন্টার:**\nযেকোনো সমস্যায় নিচের অপশন ব্যবহার করুন।",
@@ -488,7 +489,7 @@ def complete_order_and_reward(
     return rate
 
 
-def get_daily_top_users(date_str: str, limit: int = 10):
+def get_daily_top_users(date_str: str, limit: int = 5):
     db = get_db()
     rows = []
     stats_cursor = (
@@ -1080,7 +1081,7 @@ def admin_system_settings_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    f"📱 SERVICE: {d_srv}", callback_data="adm_set_default_service"
+                    f"📲 SERVICE: {d_srv}", callback_data="adm_set_default_service"
                 ),
                 InlineKeyboardButton(
                     f"🎁 REFER: {ref_r}", callback_data="adm_set_refer_reward"
@@ -1106,8 +1107,11 @@ def admin_system_settings_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "🏦 W. METHODS", callback_data="adm_set_withdraw_methods"
                 ),
-                InlineKeyboardButton("➕ Add Admin ID", callback_data="adm_add_admin"),
+                InlineKeyboardButton(
+                    "💬 OTP GROUP", callback_data="adm_set_otp_group_link"
+                ),
             ],
+            [InlineKeyboardButton("➕ Add Admin ID", callback_data="adm_add_admin")],
         ]
     )
 
@@ -1159,7 +1163,7 @@ def number_card_keyboard(country_code: str) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"📦 Stock {c_name} ({cnt})", callback_data=f"pickstock_{c_name}"
+                    f"🟢 Stock {c_name} ({cnt})", callback_data=f"pickstock_{c_name}"
                 )
             ]
         )
@@ -1168,28 +1172,23 @@ def number_card_keyboard(country_code: str) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"⚡ {pname} (Panel API)", callback_data=f"pickpanel_{pid}"
+                    f"🟢 {pname} (Panel API)", callback_data=f"pickpanel_{pid}"
                 )
             ]
         )
 
-    if get_all_countries():
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "🔄 Refresh Stock", callback_data=f"change_{country_code}"
-                ),
-                InlineKeyboardButton("🌍 Country", callback_data="countries_menu"),
-            ]
-        )
-    else:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "🔄 Refresh Stock", callback_data="change_none"
-                )
-            ]
-        )
+    change_target = country_code if country_code else "none"
+    rows.append(
+        [
+            InlineKeyboardButton("🔵 Change", callback_data=f"change_{change_target}"),
+            InlineKeyboardButton("🔵 Country", callback_data="countries_menu"),
+        ]
+    )
+
+    otp_group = get_setting("otp_group_link", "").strip()
+    if otp_group.startswith("http"):
+        rows.append([InlineKeyboardButton("🔵 OTP Group", url=otp_group)])
+
     return InlineKeyboardMarkup(rows)
 
 
@@ -1201,7 +1200,7 @@ def countries_keyboard() -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"{info['flag']} {info['name']} ({info['dial']}) — ৳{rate:.2f}",
+                    f"🟢 {info['flag']} {info['name']} ({info['dial']}) — ৳{rate:.2f}",
                     callback_data=f"setcountry_{code}",
                 )
             ]
@@ -1214,14 +1213,43 @@ def _format_number_card_header(
     flag: str,
     service_name: str,
     refreshed_str: str,
+    tag_text: str = "",
 ) -> str:
     clean_service = service_name.strip() or "Facebook"
+    clean_flag = f"{flag} " if flag else ""
+    expiry_line = f"│ 🕒 {tag_text}\n" if tag_text else ""
     return (
-        f"╔══════════════════════╗\n"
-        f"  {flag} **{country_label}**\n"
-        f"  📱 **{clean_service}**\n"
-        f"  🔄 **Refreshed:** `{refreshed_str}`\n"
-        f"╚══════════════════════╝\n"
+        f"┌───────────────────────\n"
+        f"│ 🟢 {clean_flag}**{country_label}**\n"
+        f"│ 🔵 **{clean_service}**\n"
+        f"{expiry_line}"
+        f"│ 🟣 **Refreshed:** `{refreshed_str}`\n"
+        f"└───────────────────────\n"
+    )
+
+
+def _format_roxy_order_card(
+    country_label: str,
+    flag: str,
+    service_name: str,
+    refreshed_str: str,
+    order_id: int,
+    phone_number: str,
+    rate: float,
+) -> str:
+    header = _format_number_card_header(
+        country_label=country_label,
+        flag=flag,
+        service_name=service_name,
+        refreshed_str=refreshed_str,
+        tag_text="10M",
+    )
+    return (
+        f"{header}"
+        f"🟢 **Number:** `{phone_number}`\n"
+        f"🔵 **Order ID:** `#{order_id}`\n"
+        f"🟡 **Rate:** `৳{rate:.2f}`\n"
+        f"🟣 **Status:** *Waiting for OTP...*"
     )
 
 
@@ -1247,37 +1275,39 @@ async def send_number_card(
     active_note = ""
     if active_orders:
         active_items = [
-            f"• Order `#{oid}`: `{ph}` ({resolve_country_code(cc).upper() or 'CUSTOM'})"
+            f"🟢 `{ph}` • `#{oid}` ({resolve_country_code(cc).upper() or 'CUSTOM'})"
             for oid, cc, ph, _ in active_orders[:3]
         ]
-        active_note = "\n\n⏳ **চলমান নম্বর (OTP অপেক্ষমাণ):**\n" + "\n".join(
-            active_items
-        )
+        active_note = "\n\n🟡 **Active Numbers:**\n" + "\n".join(active_items)
 
     custom_header = get_setting("text_get_num", "")
     if not stock_rows and not panels:
-        body_note = "❌ বর্তমানে স্টকে কোনো নম্বর বা কাস্টম প্যানেল নেই। অ্যাডমিন নম্বর আপলোড বা প্যানেল যুক্ত করলে এখানে দেখাবে।"
+        body_note = "🔴 **No Stock / Panel:** বর্তমানে কোনো নম্বর বা প্যানেল যুক্ত নেই।"
     else:
         body_note = (
-            custom_header if custom_header else "নিচের স্টক বা প্যানেল থেকে নম্বর নিন:"
+            custom_header
+            if custom_header
+            else "🟢 **Ready • নিচের অপশন থেকে নম্বর নিন:**"
         )
 
     if code and code in countries:
         info = countries[code]
         header_block = _format_number_card_header(
-            country_label=f"{info['name']} ({info['dial']})",
+            country_label=f"{info['name']} MIX Number",
             flag=info["flag"],
             service_name=info.get("service") or default_service,
             refreshed_str=now_str,
+            tag_text="10M",
         )
     else:
         rid_val = get_setting("voltex_rid", "").strip()
-        c_title = f"Range {rid_val}" if rid_val else "Select Country / Panel"
+        c_title = f"Range {rid_val}" if rid_val else "Select Country"
         header_block = _format_number_card_header(
             country_label=c_title,
             flag="🌍",
             service_name=default_service,
             refreshed_str=now_str,
+            tag_text="10M",
         )
 
     await context.bot.send_message(
@@ -1309,11 +1339,11 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     lines = [
         custom_traffic_hdr,
         "━━━━━━━━━━━━━━━━━━━━━━",
-        f"📦 **Unused Stock:** `{unused_total}` • **Used:** `{used_total}` • **Panels:** `{custom_panels_cnt}`",
+        f"🟢 **Unused Stock:** `{unused_total}` • 🟡 **Used:** `{used_total}` • 🔵 **Panels:** `{custom_panels_cnt}`",
         f"🔗 **API URL:** `{api_url if api_url else 'Not Set'}`",
         f"🔑 **API Key:** `{'Set' if api_key else 'Not Set'}`",
         f"📡 **API Status:** `{status_label}`",
-        f"🕒 **Refreshed:** `{now_str}`",
+        f"🟣 **Refreshed:** `{now_str}`",
     ]
 
     if countries:
@@ -1333,8 +1363,8 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
                     api_stat = f" • API: `{val}`"
 
             lines.append(
-                f"• {info['flag']} **{info['name']} (`{info['dial']}`):** "
-                f"৳`{rate:.2f}` • Completed OTPs: `{done_cnt}`{api_stat}"
+                f"🟢 {info['flag']} **{info['name']} (`{info['dial']}`):** "
+                f"🟡 `৳{rate:.2f}` • 🔵 OTPs: `{done_cnt}`{api_stat}"
             )
     else:
         lines.append("")
@@ -1346,7 +1376,7 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
         lines.append("")
         lines.append("**Available Stock by Name:**")
         for c_name, cnt in unused_rows:
-            lines.append(f"• `{c_name}`: `{cnt}` numbers")
+            lines.append(f"🟢 `{c_name}`: `{cnt}` numbers")
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1387,10 +1417,8 @@ async def announce_daily_winner(
     winner_id, w_fname, w_uname, w_cnt, w_earned = top_users[0]
     w_label = w_fname or (f"@{w_uname}" if w_uname else f"User {winner_id}")
     msg = (
-        f"👑 **Daily OTP Winner ({target_date})!**\n\n"
-        f"🏆 Winner: **{w_label}**\n"
-        f"📩 Total OTPs Today: `{w_cnt}`\n"
-        f"💰 Earned Today: `৳{float(w_earned):.2f}`"
+        f"🏆 **TOP 5 OTP LEADERBOARD** (`{target_date}`)\n\n"
+        f"🥇 **{w_label}** — `{w_cnt}` OTPs (`৳{float(w_earned):.2f}`)"
     )
     sent = await broadcast_message(context, msg)
     return True, f"Winner announced to `{sent}` users for `{target_date}`."
@@ -1404,7 +1432,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     countries = get_all_countries()
-    bot_name = get_setting("bot_name", "RSP OTP BOT")
+    bot_name = get_setting("bot_name", "RSP SMS")
     api_url = get_setting("api_url", "")
     api_key = get_setting("api_key", "")
     voltex_rid = get_setting("voltex_rid", "") or "Auto"
@@ -1428,7 +1456,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🛠️ **Admin Panel**\n\n"
         f"🤖 **Bot:** {bot_name}\n"
         f"🌍 **Total Countries:** `{len(countries)}`\n"
-        f"📱 **Service:** `{default_service}`\n"
+        f"📲 **Service:** `{default_service}`\n"
         f"🔢 **Voltex RID:** `{voltex_rid}`\n"
         f"🔗 **API URL:** `{api_url if api_url else 'Not Set'}`\n"
         f"🔑 **API Key:** `{masked_key}`\n"
@@ -1480,7 +1508,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     context.user_data.clear()
     countries = get_all_countries()
-    bot_name = get_setting("bot_name", "RSP OTP BOT")
+    bot_name = get_setting("bot_name", "RSP SMS")
     balance, otp_count, country_code = get_user_profile(user.id)
     custom_start = get_setting("text_start", "")
 
@@ -1489,12 +1517,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         if country_code and country_code in countries:
             c_info = countries[country_code]
-            c_line = f"🌍 **Selected Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)"
+            c_line = f"🟢 **Selected Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)"
         else:
-            c_line = "🌍 **Selected Country:** Not Added Yet"
+            c_line = "🟢 **Selected Country:** Not Added Yet"
         welcome_text = (
             f"👋 Welcome to **{bot_name}**!\n\n"
-            f"📊 **OTPs:** `{otp_count}` • 💰 **Balance:** `৳{balance:.2f}`\n"
+            f"🔵 **OTPs:** `{otp_count}` • 🟡 **Balance:** `৳{balance:.2f}`\n"
             f"{c_line}"
         )
     await update.message.reply_text(
@@ -1801,8 +1829,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         balance, otp_count, _ = get_user_profile(user.id)
         await update.message.reply_text(
             f"💰 **Wallet**\n\n"
-            f"• **Balance:** `৳{balance:.2f}`\n"
-            f"• **Total OTPs:** `{otp_count}`",
+            f"🟡 **Balance:** `৳{balance:.2f}`\n"
+            f"🔵 **Total OTPs:** `{otp_count}`",
             parse_mode="Markdown",
         )
     elif text in ("Refer", "🎁 REFER"):
@@ -1852,23 +1880,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     elif text in ("Leaderboard", "🟣 লিডারবোর্ড"):
         today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-        top_users = get_daily_top_users(today_str, limit=10)
+        top_users = get_daily_top_users(today_str, limit=5)
 
-        lines = [f"🏆 **Daily OTP Leaderboard ({today_str})**", ""]
+        lines = [f"🏆 **TOP 5 OTP LEADERBOARD** (`{today_str}`)", ""]
         if not top_users:
             lines.append("No completed OTPs recorded today yet.")
         else:
-            winner_id, w_fname, w_uname, w_cnt, _ = top_users[0]
-            w_label = w_fname or (f"@{w_uname}" if w_uname else f"User {winner_id}")
-            lines.append(
-                f"👑 **Current Top User:** **{w_label}** (`{w_cnt}` OTPs)\n"
-            )
             for idx, (_, fname, uname, count_val, earned_val) in enumerate(
                 top_users, start=1
             ):
                 label = fname or (f"@{uname}" if uname else "User")
+                medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(idx, f"#{idx}")
                 lines.append(
-                    f"{idx}. **{label}** — `{count_val}` OTPs (`৳{float(earned_val):.2f}`)"
+                    f"{medal} **{label}** — `{count_val}` OTPs (`৳{float(earned_val):.2f}`)"
                 )
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     elif text in ("Support", "🟠 সাপোর্ট", "🆘 সাপোর্ট"):
@@ -2024,6 +2048,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         elif s_key == "default_service":
             await query.message.reply_text(
                 "📱 Service নাম লিখুন (যেমন: `Facebook`):",
+                parse_mode="Markdown",
+            )
+        elif s_key == "otp_group_link":
+            await query.message.reply_text(
+                "💬 OTP Group link লিখুন (`https://t.me/...`) অথবা `clear` লিখুন:",
                 parse_mode="Markdown",
             )
         else:
@@ -2225,28 +2254,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         matched_code = resolve_country_code(c_name)
         if matched_code and matched_code in countries:
             c_info = countries[matched_code]
-            country_display = f"{c_info['flag']} {c_info['name']}"
+            country_display = f"{c_info['name']} MIX Number"
+            flag_display = c_info["flag"]
             service_display = c_info.get("service") or default_service
         else:
-            country_display = f"🌍 {c_name}"
+            country_display = f"{c_name} MIX Number"
+            flag_display = "🌍"
             service_display = default_service
 
         rate = get_country_rate(matched_code)
         order_id = create_active_order(user.id, matched_code, phone_num)
-        header_box = _format_number_card_header(
+        card_text = _format_roxy_order_card(
             country_label=country_display,
-            flag="",
+            flag=flag_display,
             service_name=service_display,
             refreshed_str=now_str,
+            order_id=order_id,
+            phone_number=phone_num,
+            rate=rate,
         )
-        await query.message.reply_text(
-            f"{header_box}"
-            f"🧾 **Order ID:** `#{order_id}`\n"
-            f"📱 **Phone:** `{phone_num}`\n"
-            f"💵 **Rate:** `৳{rate:.2f}`\n"
-            f"⏳ *এই নম্বরের OTP কোডের জন্য অপেক্ষা করুন।*",
-            parse_mode="Markdown",
-        )
+        await query.message.reply_text(card_text, parse_mode="Markdown")
 
     elif data.startswith("pickpanel_"):
         pid = int(data.replace("pickpanel_", "", 1))
@@ -2270,33 +2297,28 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         if detected_code and detected_code in countries:
             c_info = countries[detected_code]
-            country_display = f"{c_info['name']} ({c_info['dial']})"
+            country_display = f"{c_info['name']} MIX Number"
             flag_display = c_info["flag"]
             service_display = c_info.get("service") or details.get("service") or default_service
         else:
             rid_val = get_setting("voltex_rid", "").strip()
-            country_display = raw_api_country or (
-                f"Range {rid_val}" if rid_val else panel[1]
-            )
+            base_c = raw_api_country or (f"Range {rid_val}" if rid_val else panel[1])
+            country_display = f"{base_c} MIX Number"
             flag_display = "🌍"
             service_display = details.get("service") or default_service
 
         rate = get_country_rate(detected_code)
         order_id = create_active_order(user.id, detected_code, phone_num)
-        header_box = _format_number_card_header(
+        card_text = _format_roxy_order_card(
             country_label=country_display,
             flag=flag_display,
             service_name=service_display,
             refreshed_str=now_str,
+            order_id=order_id,
+            phone_number=phone_num,
+            rate=rate,
         )
-        await query.message.reply_text(
-            f"{header_box}"
-            f"🧾 **Order ID:** `#{order_id}`\n"
-            f"📱 **Phone:** `{phone_num}`\n"
-            f"💵 **Rate:** `৳{rate:.2f}`\n"
-            f"⏳ *এই নম্বরের OTP কোডের জন্য অপেক্ষা করুন।*",
-            parse_mode="Markdown",
-        )
+        await query.message.reply_text(card_text, parse_mode="Markdown")
 
     elif data.startswith("change_"):
         raw_c = data.replace("change_", "", 1)
@@ -2310,7 +2332,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text("⚠️ এখনো কোনো country যোগ করা হয়নি।")
             return
         await query.message.reply_text(
-            "🌍 **Select Country & Dial Code:**",
+            "🔵 **Select Country & Dial Code:**",
             parse_mode="Markdown",
             reply_markup=countries_keyboard(),
         )
@@ -2322,7 +2344,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             info = countries[c_code]
             rate = get_country_rate(c_code)
             await query.message.reply_text(
-                f"✅ Country set to {info['flag']} **{info['name']} (`{info['dial']}`)** • Service: **{info.get('service', default_service)}** — **৳{rate:.2f}**.",
+                f"🟢 Country set to {info['flag']} **{info['name']} (`{info['dial']}`)** • 🔵 **{info.get('service', default_service)}** — 🟡 **৳{rate:.2f}**",
                 parse_mode="Markdown",
             )
             await send_number_card(
@@ -2371,7 +2393,7 @@ async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     reward = complete_order_and_reward(order_id, int(user_id), resolved_code, otp_code)
     if resolved_code and resolved_code in countries:
         c_info = countries[resolved_code]
-        country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
+        country_line = f"🟢 **Country:** {c_info['flag']} {c_info['name']}\n"
     else:
         country_line = ""
 
@@ -2379,12 +2401,12 @@ async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await context.bot.send_message(
             chat_id=int(user_id),
             text=(
-                f"📩 **OTP Received!**\n\n"
-                f"🧾 **Order ID:** `#{order_id}`\n"
+                f"🟢 **OTP Received!**\n\n"
+                f"🔵 **Order ID:** `#{order_id}`\n"
                 f"{country_line}"
-                f"📱 **Phone:** `{phone_number}`\n"
-                f"🔐 **Code:** `{otp_code}`\n"
-                f"💵 **Earned:** `+৳{reward:.2f}`"
+                f"🟣 **Phone:** `{phone_number}`\n"
+                f"🟡 **Code:** `{otp_code}`\n"
+                f"🟢 **Earned:** `+৳{reward:.2f}`"
             ),
             parse_mode="Markdown",
         )
@@ -2495,7 +2517,7 @@ async def set_bot_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     new_name = " ".join(context.args).strip()
     if not new_name:
         await update.message.reply_text(
-            "Usage: `/setname RSP OTP BOT`", parse_mode="Markdown"
+            "Usage: `/setname RSP SMS`", parse_mode="Markdown"
         )
         return
     set_setting("bot_name", new_name)
@@ -2595,19 +2617,19 @@ async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
             if reward >= 0:
                 if resolved_code and resolved_code in countries:
                     c_info = countries[resolved_code]
-                    country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
+                    country_line = f"🟢 **Country:** {c_info['flag']} {c_info['name']}\n"
                 else:
                     country_line = ""
                 try:
                     await context.bot.send_message(
                         chat_id=int(user_id),
                         text=(
-                            f"📩 **OTP Received!**\n\n"
-                            f"🧾 **Order ID:** `#{order_id}`\n"
+                            f"🟢 **OTP Received!**\n\n"
+                            f"🔵 **Order ID:** `#{order_id}`\n"
                             f"{country_line}"
-                            f"📱 **Phone:** `{phone_number}`\n"
-                            f"🔐 **Code:** `{otp_code}`\n"
-                            f"💵 **Earned:** `+৳{reward:.2f}`"
+                            f"🟣 **Phone:** `{phone_number}`\n"
+                            f"🟡 **Code:** `{otp_code}`\n"
+                            f"🟢 **Earned:** `+৳{reward:.2f}`"
                         ),
                         parse_mode="Markdown",
                     )
