@@ -3,7 +3,6 @@ import datetime
 import json
 import logging
 import os
-import random
 import re
 import sqlite3
 import threading
@@ -33,9 +32,7 @@ BOT_TOKEN = os.environ.get(
 MAIN_ADMIN_ID = int(os.environ.get("ADMIN_ID", "2068530616"))
 DB_NAME = os.environ.get("DB_NAME", "rsp_otp_bot.db")
 
-ENV_API_URL = os.environ.get(
-    "VOLTEX_API_URL", "https://api.2oo9.cloud/MXS47FLFX0U/tnevs/@public/api"
-)
+ENV_API_URL = os.environ.get("VOLTEX_API_URL", "")
 ENV_API_KEY = os.environ.get("VOLTEX_API_KEY", "")
 
 logging.basicConfig(
@@ -49,46 +46,36 @@ BASE_COUNTRIES = {
         "name": "Italy",
         "flag": "🇮🇹",
         "dial": "+39",
-        "service": "Facebook",
+        "service": "OTP",
         "rate": 16.50,
-        "traffic": 148,
-        "code_sample": "FB-84920",
     },
     "bd": {
         "name": "Bangladesh",
         "flag": "🇧🇩",
         "dial": "+880",
-        "service": "Telegram",
+        "service": "OTP",
         "rate": 15.00,
-        "traffic": 212,
-        "code_sample": "TG-51094",
     },
     "us": {
         "name": "United States",
         "flag": "🇺🇸",
         "dial": "+1",
-        "service": "WhatsApp",
+        "service": "OTP",
         "rate": 20.00,
-        "traffic": 185,
-        "code_sample": "WA-73918",
     },
     "gb": {
         "name": "United Kingdom",
         "flag": "🇬🇧",
         "dial": "+44",
-        "service": "Instagram",
+        "service": "OTP",
         "rate": 14.00,
-        "traffic": 96,
-        "code_sample": "IG-30284",
     },
     "in": {
         "name": "India",
         "flag": "🇮🇳",
         "dial": "+91",
-        "service": "Gmail",
+        "service": "OTP",
         "rate": 10.00,
-        "traffic": 264,
-        "code_sample": "GM-66412",
     },
 }
 
@@ -130,9 +117,7 @@ def init_db() -> None:
             flag TEXT DEFAULT '🌍',
             dial TEXT DEFAULT '+1',
             service TEXT DEFAULT 'OTP',
-            rate REAL DEFAULT 15.0,
-            traffic INTEGER DEFAULT 120,
-            code_sample TEXT DEFAULT 'OTP-48291'
+            rate REAL DEFAULT 15.0
         )
         """
     )
@@ -247,12 +232,11 @@ def init_db() -> None:
         "withdraw_methods": "Bkash,Nagad,Binance",
         "auto_range": "ON",
         "text_start": "",
-        "text_get_num": "📱 **নম্বর নিতে নিচের দেশ বা কাস্টম প্যানেল সিলেক্ট করুন:**",
-        "text_traffic": "📊 **লাইভ ট্রাফিক এবং স্টক স্ট্যাটাস:**",
+        "text_get_num": "📱 **স্টক বা প্যানেল থেকে নম্বর সিলেক্ট করুন:**",
+        "text_traffic": "📊 **রিয়েল-টাইম স্টক ও অর্ডার স্ট্যাটাস:**",
         "text_refer": "🎁 **রেফার করে আয় করুন!**\nপ্রতি সফল রেফারে পাবেন `৳{refer_reward}`।\n\nআপনার রেফার লিংক:\n`{refer_link}`",
         "text_withdraw": "💳 **টাকা উত্তোলন (Withdrawal):**\nমিনিমাম উইথড্র: `৳{min_withdraw}`\nআপনার ব্যালেন্স: `৳{balance}`",
         "text_support": "🎧 **সাপোর্ট সেন্টার:**\nযেকোনো সমস্যায় নিচের অপশন ব্যবহার করুন।",
-        "last_traffic_alert": "",
         "last_winner_date": "",
     }
     for key, val in default_settings.items():
@@ -282,11 +266,11 @@ def get_all_countries() -> dict[str, dict]:
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT country_code, name, flag, dial, service, rate, traffic, code_sample
+        SELECT country_code, name, flag, dial, service, rate
         FROM custom_countries
         """
     )
-    for code, name, flag, dial, service, rate, traffic, sample in cursor.fetchall():
+    for code, name, flag, dial, service, rate in cursor.fetchall():
         c_key = str(code).strip().lower()
         if not c_key:
             continue
@@ -296,8 +280,6 @@ def get_all_countries() -> dict[str, dict]:
             "dial": str(dial or "+1"),
             "service": str(service or "OTP"),
             "rate": float(rate if rate is not None else 15.0),
-            "traffic": int(traffic if traffic is not None else 120),
-            "code_sample": str(sample or "OTP-48291"),
             "is_custom": True,
         }
 
@@ -332,16 +314,14 @@ def add_or_update_country(
     clean_flag = str(flag or "🌍").strip() or "🌍"
     clean_service = str(service or "OTP").strip() or "OTP"
     clean_rate = max(0.0, float(rate))
-    sample = f"{clean_service[:2].upper() or 'OT'}-{random.randint(10000, 99999)}"
-    traffic = random.randint(90, 240)
 
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
         """
         INSERT INTO custom_countries
-            (country_code, name, flag, dial, service, rate, traffic, code_sample)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (country_code, name, flag, dial, service, rate)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(country_code) DO UPDATE SET
             name = excluded.name,
             flag = excluded.flag,
@@ -349,7 +329,7 @@ def add_or_update_country(
             service = excluded.service,
             rate = excluded.rate
         """,
-        (clean_code, clean_name, clean_flag, clean_dial, clean_service, clean_rate, traffic, sample),
+        (clean_code, clean_name, clean_flag, clean_dial, clean_service, clean_rate),
     )
     cursor.execute(
         "INSERT OR REPLACE INTO country_rates (country_code, rate) VALUES (?, ?)",
@@ -383,6 +363,12 @@ def resolve_country_code(raw_country) -> str:
         for code, info in countries.items():
             if info["name"].strip().lower() == val:
                 return code
+        dial_digits = re.sub(r"\D", "", val)
+        if dial_digits:
+            for code, info in countries.items():
+                c_dial_digits = re.sub(r"\D", "", str(info.get("dial", "")))
+                if c_dial_digits and dial_digits.startswith(c_dial_digits):
+                    return code
     return "it" if "it" in countries else next(iter(countries.keys()))
 
 
@@ -643,35 +629,6 @@ def get_daily_top_users(date_str: str, limit: int = 10):
     return rows
 
 
-def generate_country_numbers(country_code: str, count: int = 3):
-    countries = get_all_countries()
-    code = resolve_country_code(country_code)
-    c_info = countries[code]
-    dial = str(c_info.get("dial") or "+1").strip()
-    if not dial.startswith("+"):
-        dial = "+" + dial
-    digits_only = re.sub(r"\D", "", dial)
-
-    numbers = []
-    for _ in range(count):
-        if digits_only == "39":
-            num = f"+393{random.randint(200000000, 999999999)}"
-        elif digits_only == "880":
-            prefix = random.choice(["3", "4", "5", "6", "7", "8", "9"])
-            num = f"+8801{prefix}{random.randint(10000000, 99999999)}"
-        elif digits_only == "1":
-            num = f"+1{random.randint(201, 989)}{random.randint(2000000, 9999999)}"
-        elif digits_only == "44":
-            num = f"+447{random.randint(100000000, 999999999)}"
-        elif digits_only == "91":
-            prefix = random.choice(["6", "7", "8", "9"])
-            num = f"+91{prefix}{random.randint(100000000, 999999999)}"
-        else:
-            num = f"+{digits_only or '1'}{random.randint(200000000, 999999999)}"
-        numbers.append(num)
-    return numbers
-
-
 def add_api_panel(
     panel_name: str, api_key: str, get_num_url: str, get_otp_url: str = ""
 ) -> None:
@@ -795,14 +752,70 @@ def pick_manual_number(country: str, user_id: int):
     return int(num_id), str(phone)
 
 
-def call_custom_panel_get_number(panel_row) -> tuple[bool, str]:
+def _extract_phone_from_text(text: str) -> str:
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in ("phone", "number", "phone_number", "mobile", "msisdn"):
+                val = data.get(key)
+                if val:
+                    return str(val).strip()
+            if isinstance(data.get("data"), dict):
+                for key in ("phone", "number", "phone_number", "mobile", "msisdn"):
+                    val = data["data"].get(key)
+                    if val:
+                        return str(val).strip()
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\+?\d{8,15}", text)
+    return match.group(0) if match else ""
+
+
+def _extract_otp_from_text(text: str) -> str | None:
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in ("code", "otp", "sms", "message"):
+                val = data.get(key)
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+            if isinstance(data.get("data"), dict):
+                for key in ("code", "otp", "sms", "message"):
+                    val = data["data"].get(key)
+                    if val is not None and str(val).strip():
+                        return str(val).strip()
+    except json.JSONDecodeError:
+        pass
+    cleaned = text.strip()
+    if re.fullmatch(r"[A-Za-z0-9\-]{4,10}", cleaned):
+        return cleaned
+    return None
+
+
+def call_custom_panel_get_number(panel_row, country_code: str = "it") -> tuple[bool, str, str]:
     _, pname, api_key, get_num_url, _, _ = panel_row
     if not get_num_url:
-        return False, "Get Number URL set kora nei."
-    target_url = get_num_url.replace("{api_key}", api_key or "")
-    if "{api_key}" not in get_num_url and api_key:
-        sep = "&" if "?" in target_url else "?"
-        target_url = f"{target_url}{sep}{urllib.parse.urlencode({'api_key': api_key})}"
+        return False, "", "Get Number URL set kora nei."
+
+    target_url = (
+        get_num_url.replace("{api_key}", api_key or "")
+        .replace("{key}", api_key or "")
+        .replace("{country}", country_code or "")
+    )
+    has_placeholder = any(ph in get_num_url for ph in ("{api_key}", "{key}", "{country}"))
+    if not has_placeholder:
+        extra = {}
+        if api_key:
+            extra["api_key"] = api_key
+        if country_code:
+            extra["country"] = country_code
+        if extra:
+            sep = "&" if "?" in target_url else "?"
+            target_url = f"{target_url}{sep}{urllib.parse.urlencode(extra)}"
 
     req = urllib.request.Request(
         target_url,
@@ -811,16 +824,54 @@ def call_custom_panel_get_number(panel_row) -> tuple[bool, str]:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             body = resp.read().decode("utf-8", errors="ignore").strip()
-            return True, body[:400] if body else "Empty response from panel"
+            phone = _extract_phone_from_text(body)
+            if phone:
+                return True, phone, body[:200]
+            return False, "", body[:200] if body else "Panel theke number pawa jayni."
     except Exception as exc:
-        return False, f"Panel Request Error: {str(exc)[:120]}"
+        return False, "", f"Panel Request Error: {str(exc)[:120]}"
+
+
+def fetch_sms_from_custom_panels(phone_number: str, country_code: str) -> str | None:
+    for _, pname, api_key, _, get_otp_url, status in list_api_panels():
+        if str(status).upper() != "ACTIVE" or not get_otp_url:
+            continue
+        target_url = (
+            get_otp_url.replace("{api_key}", api_key or "")
+            .replace("{key}", api_key or "")
+            .replace("{phone}", urllib.parse.quote(phone_number))
+            .replace("{country}", urllib.parse.quote(country_code))
+        )
+        has_placeholder = any(
+            ph in get_otp_url for ph in ("{api_key}", "{key}", "{phone}", "{country}")
+        )
+        if not has_placeholder:
+            params = {"phone": phone_number, "country": country_code}
+            if api_key:
+                params["api_key"] = api_key
+            sep = "&" if "?" in target_url else "?"
+            target_url = f"{target_url}{sep}{urllib.parse.urlencode(params)}"
+
+        req = urllib.request.Request(
+            target_url,
+            headers={"User-Agent": "Mozilla/5.0 RSP-OTP-Bot/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                body = resp.read().decode("utf-8", errors="ignore").strip()
+                otp = _extract_otp_from_text(body)
+                if otp:
+                    return otp
+        except Exception:
+            pass
+    return None
 
 
 def call_voltex_api(extra_params: dict):
     api_url = get_setting("api_url", "")
     api_key = get_setting("api_key", "")
     if not api_url:
-        return None, "URL Not Set"
+        return None, "Not Configured"
 
     params = dict(extra_params)
     if api_key:
@@ -849,8 +900,8 @@ def call_voltex_api(extra_params: dict):
             return {"raw_preview": raw_data[:120]}, "Connected"
     except urllib.error.HTTPError as exc:
         return None, f"HTTP {exc.code}"
-    except Exception:
-        return None, "Panel Sync Ready"
+    except Exception as exc:
+        return None, f"Error: {str(exc)[:60]}"
 
 
 def fetch_panel_traffic():
@@ -864,13 +915,17 @@ def fetch_sms_from_panel(phone_number: str, country_code: str):
     if isinstance(data, dict):
         for key in ("code", "otp", "sms", "message"):
             val = data.get(key)
-            if val:
+            if val is not None and str(val).strip():
                 return str(val).strip()
-    return None
+        if isinstance(data.get("data"), dict):
+            for key in ("code", "otp", "sms", "message"):
+                val = data["data"].get(key)
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+    return fetch_sms_from_custom_panels(phone_number, country_code)
 
 
-def compute_traffic_scores():
-    countries = get_all_countries()
+def get_real_completed_order_counts() -> dict[str, int]:
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -881,18 +936,27 @@ def compute_traffic_scores():
         GROUP BY country_code
         """
     )
-    order_counts = {row[0]: int(row[1]) for row in cursor.fetchall()}
+    counts = {str(row[0]): int(row[1]) for row in cursor.fetchall()}
     conn.close()
+    return counts
 
-    scores = {}
-    for code, info in countries.items():
-        base_score = (
-            int(info["traffic"])
-            + (order_counts.get(code, 0) * 15)
-            + random.randint(-4, 10)
-        )
-        scores[code] = base_score
-    return scores
+
+def get_user_active_orders(user_id: int):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, country_code, phone_number, created_at
+        FROM orders
+        WHERE user_id = ? AND status = 'ACTIVE'
+        ORDER BY id DESC
+        LIMIT 10
+        """,
+        (int(user_id),),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
 
 
 def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
@@ -987,17 +1051,11 @@ def admin_manage_countries_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def number_card_keyboard(
-    country_code: str, numbers: list[str], otp_group: str
-) -> InlineKeyboardMarkup:
+def number_card_keyboard(country_code: str, otp_group: str) -> InlineKeyboardMarkup:
     rows = []
-    for num in numbers:
-        rows.append(
-            [InlineKeyboardButton(f"☎️ {num}", callback_data=f"pick_{country_code}_{num}")]
-        )
 
     stock_rows = get_number_stock_summary("unused")
-    for c_name, cnt in stock_rows[:4]:
+    for c_name, cnt in stock_rows:
         rows.append(
             [
                 InlineKeyboardButton(
@@ -1013,7 +1071,7 @@ def number_card_keyboard(
 
     rows.append(
         [
-            InlineKeyboardButton("🔄 Change", callback_data=f"change_{country_code}"),
+            InlineKeyboardButton("🔄 Refresh Stock", callback_data=f"change_{country_code}"),
             InlineKeyboardButton("🌍 Country", callback_data="countries_menu"),
         ]
     )
@@ -1054,25 +1112,39 @@ async def send_number_card(
 
     info = countries[code]
     rate = get_country_rate(code)
-    per_req = max(1, min(6, int(float(get_setting("num_per_req", "3") or 3))))
-    numbers = generate_country_numbers(code, count=per_req)
     now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
     otp_group = get_setting("otp_group", "https://t.me/reyad0045")
+    stock_rows = get_number_stock_summary("unused")
+    panels = list_api_panels()
+
+    active_orders = get_user_active_orders(user_id)
+    active_note = ""
+    if active_orders:
+        active_items = [
+            f"• Order `#{oid}`: `{ph}` ({resolve_country_code(cc).upper()})"
+            for oid, cc, ph, _ in active_orders[:3]
+        ]
+        active_note = "\n\n⏳ **চলমান নম্বর (OTP অপেক্ষমাণ):**\n" + "\n".join(active_items)
 
     custom_header = get_setting("text_get_num", "")
+    if not stock_rows and not panels:
+        body_note = "❌ বর্তমানে স্টকে কোনো নম্বর বা কাস্টম প্যানেল নেই। অ্যাডমিন নম্বর আপলোড বা প্যানেল যুক্ত করলে এখানে দেখাবে।"
+    else:
+        body_note = custom_header if custom_header else "নিচের স্টক বা প্যানেল থেকে নম্বর নিন:"
+
     card_text = (
         f"╔══════════════════════╗\n"
-        f"  {info['flag']} **{info['name']} TOP Fresh Number**\n"
-        f"  📱 **{info['service']}** • ⏱ **10M** • ৳**{rate:.2f}**\n"
-        f"  🔄 **Refreshed:** `{now_str}`\n"
+        f"  {info['flag']} **{info['name']} ({info['dial']})**\n"
+        f"  📱 **{info['service']}** • 💵 **৳{rate:.2f}**\n"
+        f"  🕒 **Updated:** `{now_str}`\n"
         f"╚══════════════════════╝\n"
-        f"{custom_header if custom_header else 'নিচের যেকোনো নম্বরে চাপ দিয়ে কোড/অর্ডার সক্রিয় করুন:'}"
+        f"{body_note}{active_note}"
     )
     await context.bot.send_message(
         chat_id=chat_id,
         text=card_text,
         parse_mode="Markdown",
-        reply_markup=number_card_keyboard(code, numbers, otp_group),
+        reply_markup=number_card_keyboard(code, otp_group),
     )
 
 
@@ -1083,46 +1155,50 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
 
     panel_data, status_label = fetch_panel_traffic()
-    scores = compute_traffic_scores()
-    best_code = max(scores, key=scores.get)
-    best_info = countries[best_code]
-    custom_traffic_hdr = get_setting("text_traffic", "📊 **Live Traffic & Country Codes**")
+    completed_counts = get_real_completed_order_counts()
+    custom_traffic_hdr = get_setting("text_traffic", "📊 **Real-Time Stock & Order Stats**")
 
-    unused_total = sum(cnt for _, cnt in get_number_stock_summary("unused"))
-    used_total = sum(cnt for _, cnt in get_number_stock_summary("used"))
+    unused_rows = get_number_stock_summary("unused")
+    used_rows = get_number_stock_summary("used")
+    unused_total = sum(cnt for _, cnt in unused_rows)
+    used_total = sum(cnt for _, cnt in used_rows)
     custom_panels_cnt = len(list_api_panels())
 
     lines = [
         custom_traffic_hdr,
         "━━━━━━━━━━━━━━━━━━━━━━",
-        f"🔥 **Top Traffic:** {best_info['flag']} **{best_info['name']}** (`{scores[best_code]}` codes/hr)",
-        f"📦 **Manual Stock:** Unused `{unused_total}` • Used `{used_total}` • Panels `{custom_panels_cnt}`",
-        f"🔗 **Panel URL:** `{api_url if api_url else 'Not Set'}`",
-        f"🔑 **Key Status:** `{'Ready' if api_key else 'Not Set'}`",
-        f"📡 **Panel Status:** `{status_label}`",
+        f"📦 **Unused Stock:** `{unused_total}` • **Used:** `{used_total}` • **Panels:** `{custom_panels_cnt}`",
+        f"🔗 **API URL:** `{api_url if api_url else 'Not Set'}`",
+        f"🔑 **API Key:** `{'Set' if api_key else 'Not Set'}`",
+        f"📡 **API Status:** `{status_label}`",
         f"🕒 **Updated:** `{now_str}`",
         "",
-        "**Country Code Traffic Summary:**",
+        "**Country Rates & Completed OTPs:**",
     ]
 
     for code, info in countries.items():
         rate = get_country_rate(code)
-        live_count = scores[code]
-        sample_code = info["code_sample"]
+        done_cnt = completed_counts.get(code, 0)
+        api_stat = ""
         if (
             isinstance(panel_data, dict)
             and code in panel_data
             and isinstance(panel_data[code], dict)
         ):
-            live_count = panel_data[code].get(
-                "traffic", panel_data[code].get("count", live_count)
-            )
-            sample_code = panel_data[code].get("code", sample_code)
+            val = panel_data[code].get("count", panel_data[code].get("traffic"))
+            if val is not None:
+                api_stat = f" • API: `{val}`"
 
         lines.append(
             f"• {info['flag']} **{info['name']} (`{info['dial']}`):** "
-            f"`{live_count}` codes/hr • Sample: `{sample_code}` • ৳{rate:.2f}"
+            f"৳`{rate:.2f}` • Completed OTPs: `{done_cnt}`{api_stat}"
         )
+
+    if unused_rows:
+        lines.append("")
+        lines.append("**Available Stock by Name:**")
+        for c_name, cnt in unused_rows:
+            lines.append(f"• `{c_name}`: `{cnt}` numbers")
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1165,8 +1241,7 @@ async def announce_daily_winner(
         f"👑 **Daily OTP Winner ({target_date})!**\n\n"
         f"🏆 Winner: **{w_label}**\n"
         f"📩 Total OTPs Today: `{w_cnt}`\n"
-        f"💰 Earned Today: `৳{float(w_earned):.2f}`\n\n"
-        f"অভিনন্দন! আগামীকালও সেরা হতে **Get Number** চেপে চালিয়ে যান!"
+        f"💰 Earned Today: `৳{float(w_earned):.2f}`"
     )
     sent = await broadcast_message(context, msg)
     return True, f"Winner announced to `{sent}` users for `{target_date}`."
@@ -1198,14 +1273,15 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🛠️ **Admin Panel**\n\n"
         f"🤖 **Bot:** {bot_name}\n"
         f"🌍 **Total Countries:** `{len(countries)}`\n"
-        f"🔗 **Voltex URL:** `{api_url}`\n"
-        f"🔑 **Voltex Key:** `{masked_key}`\n"
+        f"🔗 **API URL:** `{api_url if api_url else 'Not Set'}`\n"
+        f"🔑 **API Key:** `{masked_key}`\n"
         f"🌐 **Custom Panels:** `{len(list_api_panels())}`\n"
         f"🎧 **Support Mode:** `{get_setting('support_mode', 'LIVE')}`\n\n"
         f"💵 **Country Rates:**\n"
         + "\n".join(rate_lines)
         + "\n\n"
         f"**Commands:**\n"
+        f"• `/sendotp <order_id> <code>`\n"
         f"• `/addcountry <code> <name> <dial> <rate> [flag] [service]`\n"
         f"• `/setrate <code> <amount>`\n"
         f"• `/setname <Bot Name>`\n"
@@ -1258,8 +1334,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         welcome_text = (
             f"👋 Welcome to **{bot_name}**!\n\n"
             f"📊 **OTPs:** `{otp_count}` • 💰 **Balance:** `৳{balance:.2f}`\n"
-            f"🌍 **Selected Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
-            f"⏳ *Note: If the bot was idle on free hosting, the first reply may take 30–60s.*"
+            f"🌍 **Selected Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)"
         )
     await update.message.reply_text(
         welcome_text,
@@ -1303,7 +1378,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     ensure_user(user.id, user.username or "", user.full_name or "")
     text = update.message.text.strip()
 
-    # Admin inline reply to Live Support message
     if is_admin(user.id) and update.message.reply_to_message:
         orig_txt = update.message.reply_to_message.text or ""
         if "User ID:" in orig_txt:
@@ -1320,7 +1394,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except Exception:
                 pass
 
-    # Admin multi-step / state inputs
     if is_admin(user.id):
         country_step = context.user_data.get("country_add_step")
         if country_step == "code":
@@ -1471,7 +1544,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.user_data["panel_draft"]["key"] = text
             context.user_data["panel_add_step"] = "num_url"
             await update.message.reply_text(
-                "3️⃣ **Get Number API URL** লিখুন (`{api_key}` প্লেসহোল্ডার ব্যবহার করতে পারেন):",
+                "3️⃣ **Get Number API URL** লিখুন (`{api_key}`, `{country}` ব্যবহার করতে পারেন):",
                 parse_mode="Markdown",
             )
             return
@@ -1479,7 +1552,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.user_data["panel_draft"]["num_url"] = text
             context.user_data["panel_add_step"] = "otp_url"
             await update.message.reply_text(
-                "4️⃣ **Get OTP URL** লিখুন অথবা `skip` লিখুন:",
+                "4️⃣ **Get OTP URL** লিখুন (`{phone}`, `{country}`, `{api_key}` ব্যবহার করতে পারেন) অথবা `skip` লিখুন:",
                 parse_mode="Markdown",
             )
             return
@@ -1499,7 +1572,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-    # User withdrawal input
     if context.user_data.get("awaiting_wd_method"):
         method = context.user_data.pop("awaiting_wd_method")
         bal = deduct_all_user_balance(user.id)
@@ -1516,7 +1588,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     text=(
                         f"💸 **New Withdrawal Request**\n\n"
                         f"• User ID: `{user.id}`\n"
-                        f"• User: {user.full_name} (@{user.username or 'N_A'})\n"
+                        f"• User: {user.full_name} (@{user.username or 'N/A'})\n"
                         f"• Method: **{method}**\n"
                         f"• Amount: `৳{bal:.2f}`\n"
                         f"• Details: `{text}`"
@@ -1527,7 +1599,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
         return
 
-    # User Live Support input
     if context.user_data.get("in_live_support"):
         for aid in get_all_admin_ids():
             try:
@@ -1608,12 +1679,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         lines = [f"🏆 **Daily OTP Leaderboard ({today_str})**", ""]
         if not top_users:
-            lines.append("No OTPs recorded today yet.")
+            lines.append("No completed OTPs recorded today yet.")
         else:
             winner_id, w_fname, w_uname, w_cnt, _ = top_users[0]
             w_label = w_fname or (f"@{w_uname}" if w_uname else f"User {winner_id}")
             lines.append(
-                f"👑 **Current Daily Winner:** **{w_label}** (`{w_cnt}` OTPs)\n"
+                f"👑 **Current Top User:** **{w_label}** (`{w_cnt}` OTPs)\n"
             )
             for idx, (_, fname, uname, count_val, earned_val) in enumerate(
                 top_users, start=1
@@ -1896,9 +1967,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         _, phone_num = picked
         matched_code = resolve_country_code(c_name)
+        c_info = countries[matched_code]
+        rate = get_country_rate(matched_code)
         order_id = create_active_order(user.id, matched_code, phone_num)
         await query.message.reply_text(
-            f"✅ **Stock Number Activated!**\n\n🧾 Order: `#{order_id}`\n📦 Stock: **{c_name}**\n📱 Phone: `{phone_num}`",
+            f"✅ **Stock Number Assigned!**\n\n"
+            f"🧾 **Order ID:** `#{order_id}`\n"
+            f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
+            f"📦 **Stock:** **{c_name}**\n"
+            f"📱 **Phone:** `{phone_num}`\n"
+            f"💵 **Rate:** `৳{rate:.2f}`\n"
+            f"⏳ *এই নম্বরের OTP কোডের জন্য অপেক্ষা করুন।*",
             parse_mode="Markdown",
         )
 
@@ -1908,29 +1987,28 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not panel:
             await query.message.reply_text("❌ Panel পাওয়া যায়নি।")
             return
-        _, resp_text = call_custom_panel_get_number(panel)
+        _, _, active_code = get_user_profile(user.id)
+        ok, phone_num, resp_text = call_custom_panel_get_number(panel, active_code)
+        if not ok or not phone_num:
+            await query.message.reply_text(
+                f"❌ **{panel[1]} Panel Error:**\n`{resp_text}`",
+                parse_mode="Markdown",
+            )
+            return
+        detected_code = resolve_country_code(phone_num) if phone_num.startswith("+") else active_code
+        c_info = countries[detected_code]
+        rate = get_country_rate(detected_code)
+        order_id = create_active_order(user.id, detected_code, phone_num)
         await query.message.reply_text(
-            f"⚡ **{panel[1]} Panel Response:**\n`{resp_text}`",
+            f"✅ **Panel Number Assigned!**\n\n"
+            f"🧾 **Order ID:** `#{order_id}`\n"
+            f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
+            f"⚡ **Panel:** **{panel[1]}**\n"
+            f"📱 **Phone:** `{phone_num}`\n"
+            f"💵 **Rate:** `৳{rate:.2f}`\n"
+            f"⏳ *এই নম্বরের OTP কোডের জন্য অপেক্ষা করুন।*",
             parse_mode="Markdown",
         )
-
-    elif data.startswith("pick_"):
-        parts = data.split("_", 2)
-        if len(parts) == 3:
-            _, raw_c_code, phone_number = parts
-            c_code = resolve_country_code(raw_c_code)
-            c_info = countries[c_code]
-            rate = get_country_rate(c_code)
-            order_id = create_active_order(user.id, c_code, phone_number)
-            reply_text = (
-                f"✅ **Number Activated!**\n\n"
-                f"🧾 **Order ID:** `#{order_id}`\n"
-                f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
-                f"📱 **Phone:** `{phone_number}`\n"
-                f"💵 **Reward:** `৳{rate:.2f}`\n"
-                f"⏳ *Waiting for OTP code... Code aslei bot show korbe.*"
-            )
-            await query.message.reply_text(reply_text, parse_mode="Markdown")
 
     elif data.startswith("change_"):
         c_code = resolve_country_code(data.replace("change_", "", 1))
@@ -1962,6 +2040,62 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "otp_group_info":
         support = get_setting("support_contact", "@reyad0045")
         await query.message.reply_text(f"💬 OTP Group / Support: {support}")
+
+
+async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Usage: `/sendotp <order_id> <otp_code>`", parse_mode="Markdown"
+        )
+        return
+
+    order_id = int(context.args[0])
+    otp_code = " ".join(context.args[1:]).strip()
+    countries = get_all_countries()
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id, country_code, phone_number, status FROM orders WHERE id = ?",
+        (order_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        await update.message.reply_text(f"❌ Order `#{order_id}` পাওয়া যায়নি।", parse_mode="Markdown")
+        return
+
+    user_id, c_code, phone_number, status = row
+    if status != "ACTIVE":
+        await update.message.reply_text(f"⚠️ Order `#{order_id}` already `{status}`.", parse_mode="Markdown")
+        return
+
+    resolved_code = resolve_country_code(c_code)
+    reward = complete_order_and_reward(order_id, int(user_id), resolved_code, otp_code)
+    c_info = countries[resolved_code]
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                f"📩 **OTP Received!**\n\n"
+                f"🧾 **Order ID:** `#{order_id}`\n"
+                f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
+                f"📱 **Phone:** `{phone_number}`\n"
+                f"🔐 **Code:** `{otp_code}`\n"
+                f"💵 **Earned:** `+৳{reward:.2f}`"
+            ),
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(
+            f"✅ Order `#{order_id}` (`{phone_number}`)-এ OTP `{otp_code}` পাঠানো হয়েছে (`+৳{reward:.2f}`)।",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ মেসেজ পাঠাতে সমস্যা: `{exc}`", parse_mode="Markdown")
 
 
 async def add_country_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2105,10 +2239,10 @@ async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
         resolved_code = resolve_country_code(c_code)
         otp_code = fetch_sms_from_panel(phone_number, resolved_code)
         if not otp_code:
-            otp_code = f"{random.randint(100000, 999999)}"
+            continue
 
         reward = complete_order_and_reward(int(order_id), int(user_id), resolved_code, otp_code)
-        if reward > 0 or otp_code:
+        if reward >= 0:
             c_info = countries[resolved_code]
             try:
                 await context.bot.send_message(
@@ -2125,30 +2259,6 @@ async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             except Exception as exc:
                 logger.warning("Failed to send OTP message to %s: %s", user_id, exc)
-
-
-async def job_auto_traffic_alert(context: ContextTypes.DEFAULT_TYPE) -> None:
-    countries = get_all_countries()
-    scores = compute_traffic_scores()
-    if not scores:
-        return
-    best_code = max(scores, key=scores.get)
-    last_alert = get_setting("last_traffic_alert", "")
-    if best_code == last_alert:
-        return
-
-    set_setting("last_traffic_alert", best_code)
-    info = countries[best_code]
-    rate = get_country_rate(best_code)
-    alert_text = (
-        f"🚦 **High Traffic Alert!**\n\n"
-        f"🌍 **Best Country:** {info['flag']} **{info['name']}** (`{info['dial']}`)\n"
-        f"📱 **Service:** **{info['service']}**\n"
-        f"⚡ **Traffic:** `{scores[best_code]}` codes/hr\n"
-        f"💵 **Rate:** `৳{rate:.2f}`\n\n"
-        f"এখন **Get Number** চেপে দ্রুত কোড নিতে পারেন!"
-    )
-    await broadcast_message(context, alert_text)
 
 
 async def job_daily_winner_announce(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2185,6 +2295,7 @@ def main() -> None:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("sendotp", send_otp_cmd))
     app.add_handler(CommandHandler("addcountry", add_country_cmd))
     app.add_handler(CommandHandler("setrate", set_rate_cmd))
     app.add_handler(CommandHandler("setname", set_bot_name))
@@ -2197,7 +2308,6 @@ def main() -> None:
 
     if app.job_queue:
         app.job_queue.run_repeating(job_poll_otps, interval=5, first=5)
-        app.job_queue.run_repeating(job_auto_traffic_alert, interval=300, first=30)
         app.job_queue.run_repeating(job_daily_winner_announce, interval=60, first=60)
 
     logger.info("Bot started...")
