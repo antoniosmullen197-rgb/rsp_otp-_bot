@@ -5,12 +5,14 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import certifi
 from flask import Flask
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -31,7 +33,9 @@ BOT_TOKEN = os.environ.get(
     "BOT_TOKEN", "9178685196:AAGnHHXm7at9Pt8IWIW-zPdiOPkl564dl3U"
 )
 MAIN_ADMIN_ID = int(os.environ.get("ADMIN_ID", "2068530616"))
-DB_NAME = os.environ.get("DB_NAME", "rsp_otp_bot.db")
+
+MONGO_URI = os.environ.get("MONGO_URI", "").strip()
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "rsp_otp_bot").strip()
 
 ENV_API_URL = os.environ.get("VOLTEX_API_URL", "")
 ENV_API_KEY = os.environ.get("VOLTEX_API_KEY", "")
@@ -44,150 +48,74 @@ logger = logging.getLogger(__name__)
 
 BASE_COUNTRIES: dict[str, dict] = {}
 
+_mongo_client: MongoClient | None = None
+_db = None
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_NAME, timeout=20, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
+
+def get_db():
+    global _mongo_client, _db
+    if _db is not None:
+        return _db
+    if not MONGO_URI:
+        raise RuntimeError(
+            "MONGO_URI environment variable is not set! Add MONGO_URI in Render Environment Variables."
+        )
+    _mongo_client = MongoClient(
+        MONGO_URI,
+        tlsCAFile=certifi.where(),
+        serverSelectionTimeoutMS=8000,
+    )
+    _db = _mongo_client[MONGO_DB_NAME]
+    return _db
+
+
+def get_next_sequence(seq_name: str) -> int:
+    db = get_db()
+    doc = db.counters.find_one_and_update(
+        {"_id": seq_name},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(doc["seq"])
 
 
 def init_db() -> None:
-    conn = get_conn()
-    cursor = conn.cursor()
+    db = get_db()
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """
+    db.settings.create_index([("key", ASCENDING)], unique=True)
+    db.admins.create_index([("user_id", ASCENDING)], unique=True)
+    db.custom_countries.create_index([("country_code", ASCENDING)], unique=True)
+    db.country_rates.create_index([("country_code", ASCENDING)], unique=True)
+    db.users.create_index([("user_id", ASCENDING)], unique=True)
+    db.daily_stats.create_index(
+        [("stat_date", ASCENDING), ("user_id", ASCENDING)], unique=True
+    )
+    db.orders.create_index([("id", ASCENDING)], unique=True)
+    db.orders.create_index([("status", ASCENDING), ("created_at", ASCENDING)])
+    db.numbers.create_index([("phone", ASCENDING)], unique=True)
+    db.numbers.create_index([("country", ASCENDING), ("status", ASCENDING)])
+    db.api_panels.create_index([("id", ASCENDING)], unique=True)
+
+    db.admins.update_one(
+        {"user_id": int(MAIN_ADMIN_ID)},
+        {"$setOnInsert": {"user_id": int(MAIN_ADMIN_ID)}},
+        upsert=True,
     )
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY
-        )
-        """
-    )
-    cursor.execute(
-        "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
-        (MAIN_ADMIN_ID,),
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS custom_countries (
-            country_code TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            flag TEXT DEFAULT '🌍',
-            dial TEXT DEFAULT '+1',
-            service TEXT DEFAULT 'Facebook',
-            rate REAL DEFAULT 15.0
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS country_rates (
-            country_code TEXT PRIMARY KEY,
-            rate REAL NOT NULL
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            balance REAL DEFAULT 0.0,
-            otp_count INTEGER DEFAULT 0,
-            selected_country TEXT DEFAULT '',
-            referred_by INTEGER,
-            last_req REAL DEFAULT 0,
-            joined_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS daily_stats (
-            stat_date TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            otp_count INTEGER DEFAULT 0,
-            earned REAL DEFAULT 0.0,
-            PRIMARY KEY (stat_date, user_id)
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            country_code TEXT,
-            phone_number TEXT,
-            otp_code TEXT,
-            status TEXT DEFAULT 'ACTIVE',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS numbers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            country TEXT,
-            phone TEXT UNIQUE,
-            status TEXT DEFAULT 'unused',
-            used_by INTEGER
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS api_panels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            panel_name TEXT,
-            api_key TEXT,
-            get_num_url TEXT,
-            get_otp_url TEXT,
-            status TEXT DEFAULT 'ACTIVE'
-        )
-        """
-    )
-
-    cursor.execute("PRAGMA table_info(users)")
-    user_cols = {row[1] for row in cursor.fetchall()}
-    if "otp_count" not in user_cols:
-        cursor.execute("ALTER TABLE users ADD COLUMN otp_count INTEGER DEFAULT 0")
-    if "selected_country" not in user_cols:
-        cursor.execute("ALTER TABLE users ADD COLUMN selected_country TEXT DEFAULT ''")
-    if "referred_by" not in user_cols:
-        cursor.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
-    if "last_req" not in user_cols:
-        cursor.execute("ALTER TABLE users ADD COLUMN last_req REAL DEFAULT 0")
-
-    for removed_code in ("it", "bd", "us", "gb", "in"):
-        cursor.execute("DELETE FROM country_rates WHERE country_code = ?", (removed_code,))
-        cursor.execute("DELETE FROM custom_countries WHERE country_code = ?", (removed_code,))
-
-    cursor.execute(
-        "UPDATE users SET selected_country = '' WHERE selected_country IN ('it', 'bd', 'us', 'gb', 'in')"
+    removed_codes = ["it", "bd", "us", "gb", "in"]
+    db.country_rates.delete_many({"country_code": {"$in": removed_codes}})
+    db.custom_countries.delete_many({"country_code": {"$in": removed_codes}})
+    db.users.update_many(
+        {"selected_country": {"$in": removed_codes}},
+        {"$set": {"selected_country": ""}},
     )
 
     for code, info in BASE_COUNTRIES.items():
-        cursor.execute(
-            "INSERT OR IGNORE INTO country_rates (country_code, rate) VALUES (?, ?)",
-            (code, float(info["rate"])),
+        db.country_rates.update_one(
+            {"country_code": str(code).lower()},
+            {"$setOnInsert": {"country_code": str(code).lower(), "rate": float(info["rate"])}},
+            upsert=True,
         )
 
     default_settings = {
@@ -216,56 +144,49 @@ def init_db() -> None:
         "last_winner_date": "",
     }
     for key, val in default_settings.items():
-        cursor.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-            (key, val),
+        db.settings.update_one(
+            {"key": key},
+            {"$setOnInsert": {"key": key, "value": val}},
+            upsert=True,
         )
 
     if os.environ.get("VOLTEX_API_URL"):
-        cursor.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('api_url', ?)",
-            (os.environ["VOLTEX_API_URL"].strip(),),
+        db.settings.update_one(
+            {"key": "api_url"},
+            {"$set": {"key": "api_url", "value": os.environ["VOLTEX_API_URL"].strip()}},
+            upsert=True,
         )
     if os.environ.get("VOLTEX_API_KEY"):
-        cursor.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('api_key', ?)",
-            (os.environ["VOLTEX_API_KEY"].strip(),),
+        db.settings.update_one(
+            {"key": "api_key"},
+            {"$set": {"key": "api_key", "value": os.environ["VOLTEX_API_KEY"].strip()}},
+            upsert=True,
         )
-
-    conn.commit()
-    conn.close()
 
 
 def get_all_countries() -> dict[str, dict]:
+    db = get_db()
     countries = {k: dict(v) for k, v in BASE_COUNTRIES.items()}
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT country_code, name, flag, dial, service, rate
-        FROM custom_countries
-        """
-    )
-    for code, name, flag, dial, service, rate in cursor.fetchall():
-        c_key = str(code).strip().lower()
+
+    for doc in db.custom_countries.find():
+        c_key = str(doc.get("country_code", "")).strip().lower()
         if not c_key:
             continue
         countries[c_key] = {
-            "name": str(name or c_key.upper()),
-            "flag": str(flag or "🌍"),
-            "dial": str(dial or "+1"),
-            "service": str(service or "Facebook"),
-            "rate": float(rate if rate is not None else 15.0),
+            "name": str(doc.get("name") or c_key.upper()),
+            "flag": str(doc.get("flag") or "🌍"),
+            "dial": str(doc.get("dial") or "+1"),
+            "service": str(doc.get("service") or "Facebook"),
+            "rate": float(doc.get("rate") if doc.get("rate") is not None else 15.0),
             "is_custom": True,
         }
 
-    cursor.execute("SELECT country_code, rate FROM country_rates")
-    for code, rate in cursor.fetchall():
-        c_key = str(code).strip().lower()
+    for doc in db.country_rates.find():
+        c_key = str(doc.get("country_code", "")).strip().lower()
+        rate = doc.get("rate")
         if c_key in countries and rate is not None:
             countries[c_key]["rate"] = float(rate)
 
-    conn.close()
     return countries
 
 
@@ -291,28 +212,26 @@ def add_or_update_country(
     clean_service = str(service or "Facebook").strip() or "Facebook"
     clean_rate = max(0.0, float(rate))
 
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO custom_countries
-            (country_code, name, flag, dial, service, rate)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(country_code) DO UPDATE SET
-            name = excluded.name,
-            flag = excluded.flag,
-            dial = excluded.dial,
-            service = excluded.service,
-            rate = excluded.rate
-        """,
-        (clean_code, clean_name, clean_flag, clean_dial, clean_service, clean_rate),
+    db = get_db()
+    db.custom_countries.update_one(
+        {"country_code": clean_code},
+        {
+            "$set": {
+                "country_code": clean_code,
+                "name": clean_name,
+                "flag": clean_flag,
+                "dial": clean_dial,
+                "service": clean_service,
+                "rate": clean_rate,
+            }
+        },
+        upsert=True,
     )
-    cursor.execute(
-        "INSERT OR REPLACE INTO country_rates (country_code, rate) VALUES (?, ?)",
-        (clean_code, clean_rate),
+    db.country_rates.update_one(
+        {"country_code": clean_code},
+        {"$set": {"country_code": clean_code, "rate": clean_rate}},
+        upsert=True,
     )
-    conn.commit()
-    conn.close()
     return True, clean_code
 
 
@@ -320,14 +239,10 @@ def delete_custom_country(country_code: str) -> bool:
     c_key = str(country_code or "").strip().lower()
     if not c_key or c_key in BASE_COUNTRIES:
         return False
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM custom_countries WHERE country_code = ?", (c_key,))
-    cursor.execute("DELETE FROM country_rates WHERE country_code = ?", (c_key,))
-    deleted = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
-    return deleted
+    db = get_db()
+    res = db.custom_countries.delete_one({"country_code": c_key})
+    db.country_rates.delete_one({"country_code": c_key})
+    return res.deleted_count > 0
 
 
 def resolve_country_code(raw_country) -> str:
@@ -351,13 +266,10 @@ def resolve_country_code(raw_country) -> str:
 
 
 def get_setting(key: str, default: str = "") -> str:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cursor.fetchone()
-    conn.close()
-    if row and row[0] is not None and row[0] != "":
-        return row[0]
+    db = get_db()
+    doc = db.settings.find_one({"key": key})
+    if doc and doc.get("value") is not None and doc.get("value") != "":
+        return str(doc["value"])
     if key == "api_url" and ENV_API_URL:
         return ENV_API_URL
     if key == "api_key" and ENV_API_KEY:
@@ -366,25 +278,21 @@ def get_setting(key: str, default: str = "") -> str:
 
 
 def set_setting(key: str, value: str) -> None:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        (key, str(value)),
+    db = get_db()
+    db.settings.update_one(
+        {"key": key},
+        {"$set": {"key": key, "value": str(value)}},
+        upsert=True,
     )
-    conn.commit()
-    conn.close()
 
 
 def get_all_admin_ids() -> list[int]:
+    db = get_db()
     admin_ids = {int(MAIN_ADMIN_ID)}
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM admins")
-    for (uid,) in cursor.fetchall():
+    for doc in db.admins.find():
+        uid = doc.get("user_id")
         if uid is not None:
             admin_ids.add(int(uid))
-    conn.close()
     return list(admin_ids)
 
 
@@ -393,14 +301,12 @@ def is_admin(user_id: int) -> bool:
 
 
 def add_admin_id(new_admin_id: int) -> None:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
-        (int(new_admin_id),),
+    db = get_db()
+    db.admins.update_one(
+        {"user_id": int(new_admin_id)},
+        {"$setOnInsert": {"user_id": int(new_admin_id)}},
+        upsert=True,
     )
-    conn.commit()
-    conn.close()
 
 
 def get_country_rate(country_code: str) -> float:
@@ -408,13 +314,10 @@ def get_country_rate(country_code: str) -> float:
     code = resolve_country_code(country_code)
     if not code or code not in countries:
         return 0.0
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT rate FROM country_rates WHERE country_code = ?", (code,))
-    row = cursor.fetchone()
-    conn.close()
-    if row and row[0] is not None:
-        return float(row[0])
+    db = get_db()
+    doc = db.country_rates.find_one({"country_code": code})
+    if doc and doc.get("rate") is not None:
+        return float(doc["rate"])
     return float(countries[code]["rate"])
 
 
@@ -422,18 +325,16 @@ def set_country_rate(country_code: str, rate: float) -> None:
     code = resolve_country_code(country_code)
     if not code:
         return
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO country_rates (country_code, rate) VALUES (?, ?)",
-        (code, float(rate)),
+    db = get_db()
+    db.country_rates.update_one(
+        {"country_code": code},
+        {"$set": {"country_code": code, "rate": float(rate)}},
+        upsert=True,
     )
-    cursor.execute(
-        "UPDATE custom_countries SET rate = ? WHERE country_code = ?",
-        (float(rate), code),
+    db.custom_countries.update_one(
+        {"country_code": code},
+        {"$set": {"rate": float(rate)}},
     )
-    conn.commit()
-    conn.close()
 
 
 def ensure_user(
@@ -442,110 +343,103 @@ def ensure_user(
     full_name: str = "",
     referred_by: int | None = None,
 ) -> bool:
+    db = get_db()
     default_c = resolve_country_code("")
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    exists = cursor.fetchone() is not None
+    uid = int(user_id)
+    exists = db.users.find_one({"user_id": uid}) is not None
     if not exists:
         ref_val = (
             int(referred_by)
-            if referred_by and int(referred_by) != int(user_id)
+            if referred_by and int(referred_by) != uid
             else None
         )
-        cursor.execute(
-            """
-            INSERT INTO users (user_id, username, full_name, balance, otp_count, selected_country, referred_by)
-            VALUES (?, ?, ?, 0.0, 0, ?, ?)
-            """,
-            (user_id, username or "", full_name or "", default_c, ref_val),
+        db.users.insert_one(
+            {
+                "user_id": uid,
+                "username": username or "",
+                "full_name": full_name or "",
+                "balance": 0.0,
+                "otp_count": 0,
+                "selected_country": default_c,
+                "referred_by": ref_val,
+                "last_req": 0.0,
+                "joined_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
         )
     else:
-        cursor.execute(
-            """
-            UPDATE users
-            SET username = COALESCE(NULLIF(?, ''), username),
-                full_name = COALESCE(NULLIF(?, ''), full_name)
-            WHERE user_id = ?
-            """,
-            (username or "", full_name or "", user_id),
-        )
-    conn.commit()
-    conn.close()
+        update_fields = {}
+        if username:
+            update_fields["username"] = username
+        if full_name:
+            update_fields["full_name"] = full_name
+        if update_fields:
+            db.users.update_one({"user_id": uid}, {"$set": update_fields})
     return not exists
 
 
 def add_user_balance(user_id: int, amount: float) -> None:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE users
-        SET balance = ROUND(balance + ?, 2)
-        WHERE user_id = ?
-        """,
-        (float(amount), int(user_id)),
-    )
-    conn.commit()
-    conn.close()
+    db = get_db()
+    uid = int(user_id)
+    db.users.update_one({"user_id": uid}, {"$inc": {"balance": float(amount)}})
+    doc = db.users.find_one({"user_id": uid}, {"balance": 1})
+    if doc is not None:
+        rounded = round(float(doc.get("balance") or 0.0), 2)
+        db.users.update_one({"user_id": uid}, {"$set": {"balance": rounded}})
 
 
 def deduct_all_user_balance(user_id: int) -> float:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (int(user_id),))
-    row = cursor.fetchone()
-    bal = float(row[0] or 0.0) if row else 0.0
-    cursor.execute("UPDATE users SET balance = 0.0 WHERE user_id = ?", (int(user_id),))
-    conn.commit()
-    conn.close()
-    return bal
+    db = get_db()
+    uid = int(user_id)
+    doc = db.users.find_one_and_update(
+        {"user_id": uid},
+        {"$set": {"balance": 0.0}},
+    )
+    return float(doc.get("balance") or 0.0) if doc else 0.0
 
 
 def get_user_profile(user_id: int):
     countries = get_all_countries()
     fallback_c = resolve_country_code("")
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT balance, otp_count, selected_country FROM users WHERE user_id = ?",
-        (user_id,),
+    db = get_db()
+    doc = db.users.find_one(
+        {"user_id": int(user_id)},
+        {"balance": 1, "otp_count": 1, "selected_country": 1},
     )
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
+    if not doc:
         return 0.0, 0, fallback_c
-    raw_c = str(row[2] or "").strip().lower()
+    raw_c = str(doc.get("selected_country") or "").strip().lower()
     country = raw_c if raw_c in countries else fallback_c
-    return float(row[0] or 0.0), int(row[1] or 0), country
+    return (
+        float(doc.get("balance") or 0.0),
+        int(doc.get("otp_count") or 0),
+        country,
+    )
 
 
 def set_user_country(user_id: int, country_code: str) -> None:
     code = resolve_country_code(country_code)
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE users SET selected_country = ? WHERE user_id = ?",
-        (code, user_id),
+    db = get_db()
+    db.users.update_one(
+        {"user_id": int(user_id)},
+        {"$set": {"selected_country": code}},
     )
-    conn.commit()
-    conn.close()
 
 
 def create_active_order(user_id: int, country_code: str, phone_number: str) -> int:
     code = resolve_country_code(country_code) or "custom"
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO orders (user_id, country_code, phone_number, otp_code, status)
-        VALUES (?, ?, ?, NULL, 'ACTIVE')
-        """,
-        (user_id, code, phone_number),
+    order_id = get_next_sequence("orders")
+    db = get_db()
+    db.orders.insert_one(
+        {
+            "id": int(order_id),
+            "user_id": int(user_id),
+            "country_code": code,
+            "phone_number": phone_number,
+            "otp_code": None,
+            "status": "ACTIVE",
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
+        }
     )
-    order_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
     return int(order_id)
 
 
@@ -553,109 +447,123 @@ def complete_order_and_reward(
     order_id: int, user_id: int, country_code: str, otp_code: str
 ) -> float:
     code = resolve_country_code(country_code)
-    rate = get_country_rate(code) if code else 0.0
+    rate = float(get_country_rate(code) if code else 0.0)
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    db = get_db()
 
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE orders
-        SET status = 'COMPLETED', otp_code = ?
-        WHERE id = ? AND status = 'ACTIVE'
-        """,
-        (otp_code, order_id),
+    res = db.orders.update_one(
+        {"id": int(order_id), "status": "ACTIVE"},
+        {"$set": {"status": "COMPLETED", "otp_code": otp_code}},
     )
-    updated = cursor.rowcount
-    if updated > 0:
-        cursor.execute(
-            """
-            UPDATE users
-            SET balance = ROUND(balance + ?, 2),
-                otp_count = otp_count + 1
-            WHERE user_id = ?
-            """,
-            (rate, user_id),
+    if res.modified_count > 0:
+        uid = int(user_id)
+        db.users.update_one(
+            {"user_id": uid},
+            {"$inc": {"balance": rate, "otp_count": 1}},
         )
-        cursor.execute(
-            """
-            INSERT INTO daily_stats (stat_date, user_id, otp_count, earned)
-            VALUES (?, ?, 1, ?)
-            ON CONFLICT(stat_date, user_id) DO UPDATE SET
-                otp_count = otp_count + 1,
-                earned = ROUND(earned + excluded.earned, 2)
-            """,
-            (today_str, user_id, rate),
+        udoc = db.users.find_one({"user_id": uid}, {"balance": 1})
+        if udoc is not None:
+            db.users.update_one(
+                {"user_id": uid},
+                {"$set": {"balance": round(float(udoc.get("balance") or 0.0), 2)}},
+            )
+
+        db.daily_stats.update_one(
+            {"stat_date": today_str, "user_id": uid},
+            {
+                "$inc": {"otp_count": 1, "earned": rate},
+                "$setOnInsert": {"stat_date": today_str, "user_id": uid},
+            },
+            upsert=True,
         )
-    conn.commit()
-    conn.close()
+        sdoc = db.daily_stats.find_one(
+            {"stat_date": today_str, "user_id": uid}, {"earned": 1}
+        )
+        if sdoc is not None:
+            db.daily_stats.update_one(
+                {"stat_date": today_str, "user_id": uid},
+                {"$set": {"earned": round(float(sdoc.get("earned") or 0.0), 2)}},
+            )
     return rate
 
 
 def get_daily_top_users(date_str: str, limit: int = 10):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT u.user_id, u.full_name, u.username, d.otp_count, d.earned
-        FROM daily_stats d
-        JOIN users u ON u.user_id = d.user_id
-        WHERE d.stat_date = ? AND d.otp_count > 0
-        ORDER BY d.otp_count DESC, d.earned DESC
-        LIMIT ?
-        """,
-        (date_str, limit),
+    db = get_db()
+    rows = []
+    stats_cursor = (
+        db.daily_stats.find({"stat_date": date_str, "otp_count": {"$gt": 0}})
+        .sort([("otp_count", DESCENDING), ("earned", DESCENDING)])
+        .limit(int(limit))
     )
-    rows = cursor.fetchall()
-    conn.close()
+    for st in stats_cursor:
+        uid = int(st["user_id"])
+        udoc = db.users.find_one(
+            {"user_id": uid}, {"full_name": 1, "username": 1}
+        ) or {}
+        rows.append(
+            (
+                uid,
+                udoc.get("full_name", ""),
+                udoc.get("username", ""),
+                int(st.get("otp_count") or 0),
+                float(st.get("earned") or 0.0),
+            )
+        )
     return rows
 
 
 def add_api_panel(
     panel_name: str, api_key: str, get_num_url: str, get_otp_url: str = ""
 ) -> None:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO api_panels (panel_name, api_key, get_num_url, get_otp_url, status)
-        VALUES (?, ?, ?, ?, 'ACTIVE')
-        """,
-        (panel_name.strip(), api_key.strip(), get_num_url.strip(), get_otp_url.strip()),
+    pid = get_next_sequence("api_panels")
+    db = get_db()
+    db.api_panels.insert_one(
+        {
+            "id": int(pid),
+            "panel_name": panel_name.strip(),
+            "api_key": api_key.strip(),
+            "get_num_url": get_num_url.strip(),
+            "get_otp_url": get_otp_url.strip(),
+            "status": "ACTIVE",
+        }
     )
-    conn.commit()
-    conn.close()
 
 
 def list_api_panels():
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, panel_name, api_key, get_num_url, get_otp_url, status FROM api_panels ORDER BY id ASC"
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    db = get_db()
+    rows = []
+    for doc in db.api_panels.find().sort("id", ASCENDING):
+        rows.append(
+            (
+                int(doc["id"]),
+                doc.get("panel_name", ""),
+                doc.get("api_key", ""),
+                doc.get("get_num_url", ""),
+                doc.get("get_otp_url", ""),
+                doc.get("status", "ACTIVE"),
+            )
+        )
     return rows
 
 
 def get_api_panel(panel_id: int):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, panel_name, api_key, get_num_url, get_otp_url, status FROM api_panels WHERE id = ?",
-        (int(panel_id),),
+    db = get_db()
+    doc = db.api_panels.find_one({"id": int(panel_id)})
+    if not doc:
+        return None
+    return (
+        int(doc["id"]),
+        doc.get("panel_name", ""),
+        doc.get("api_key", ""),
+        doc.get("get_num_url", ""),
+        doc.get("get_otp_url", ""),
+        doc.get("status", "ACTIVE"),
     )
-    row = cursor.fetchone()
-    conn.close()
-    return row
 
 
 def delete_api_panel(panel_id: int) -> None:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM api_panels WHERE id = ?", (int(panel_id),))
-    conn.commit()
-    conn.close()
+    db = get_db()
+    db.api_panels.delete_one({"id": int(panel_id)})
 
 
 def upload_manual_numbers(country, raw_numbers) -> int:
@@ -673,65 +581,52 @@ def upload_manual_numbers(country, raw_numbers) -> int:
     else:
         items = []
 
-    conn = get_conn()
-    cursor = conn.cursor()
+    db = get_db()
     added = 0
     for item in items:
         phone = str(item or "").strip()
         if not phone:
             continue
         try:
-            cursor.execute(
-                "INSERT INTO numbers (country, phone, status) VALUES (?, ?, 'unused')",
-                (c_name, phone),
+            db.numbers.insert_one(
+                {
+                    "country": c_name,
+                    "phone": phone,
+                    "status": "unused",
+                    "used_by": None,
+                }
             )
             added += 1
-        except sqlite3.IntegrityError:
+        except DuplicateKeyError:
             pass
-    conn.commit()
-    conn.close()
     return added
 
 
 def get_number_stock_summary(status: str):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT country, COUNT(*) FROM numbers WHERE status = ? GROUP BY country",
-        (status,),
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+    db = get_db()
+    pipeline = [
+        {"$match": {"status": status}},
+        {"$group": {"_id": "$country", "count": {"$sum": 1}}},
+    ]
+    return [(doc["_id"], int(doc["count"])) for doc in db.numbers.aggregate(pipeline)]
 
 
 def clear_all_manual_numbers() -> None:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM numbers")
-    conn.commit()
-    conn.close()
+    db = get_db()
+    db.numbers.delete_many({})
 
 
 def pick_manual_number(country: str, user_id: int):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, phone FROM numbers WHERE country = ? AND status = 'unused' LIMIT 1",
-        (country,),
+    db = get_db()
+    doc = db.numbers.find_one_and_update(
+        {"country": country, "status": "unused"},
+        {"$set": {"status": "used", "used_by": int(user_id)}},
+        return_document=ReturnDocument.BEFORE,
     )
-    row = cursor.fetchone()
-    if not row:
-        conn.close()
+    if not doc:
         return None
-    num_id, phone = row
-    cursor.execute(
-        "UPDATE numbers SET status = 'used', used_by = ? WHERE id = ?",
-        (int(user_id), int(num_id)),
-    )
-    conn.commit()
-    conn.close()
-    return int(num_id), str(phone)
+    num_id = doc.get("_id")
+    return int(hash(str(num_id)) & 0x7FFFFFFF), str(doc["phone"])
 
 
 def _try_decode_base64_text(text: str) -> str:
@@ -1072,36 +967,31 @@ def fetch_sms_from_panel(phone_number: str, country_code: str):
 
 
 def get_real_completed_order_counts() -> dict[str, int]:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT country_code, COUNT(*) as cnt
-        FROM orders
-        WHERE status = 'COMPLETED'
-        GROUP BY country_code
-        """
-    )
-    counts = {str(row[0]): int(row[1]) for row in cursor.fetchall()}
-    conn.close()
-    return counts
+    db = get_db()
+    pipeline = [
+        {"$match": {"status": "COMPLETED"}},
+        {"$group": {"_id": "$country_code", "cnt": {"$sum": 1}}},
+    ]
+    return {str(doc["_id"]): int(doc["cnt"]) for doc in db.orders.aggregate(pipeline)}
 
 
 def get_user_active_orders(user_id: int):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT id, country_code, phone_number, created_at
-        FROM orders
-        WHERE user_id = ? AND status = 'ACTIVE'
-        ORDER BY id DESC
-        LIMIT 10
-        """,
-        (int(user_id),),
+    db = get_db()
+    rows = []
+    cursor = (
+        db.orders.find({"user_id": int(user_id), "status": "ACTIVE"})
+        .sort("id", DESCENDING)
+        .limit(10)
     )
-    rows = cursor.fetchall()
-    conn.close()
+    for doc in cursor:
+        rows.append(
+            (
+                int(doc["id"]),
+                doc.get("country_code", ""),
+                doc.get("phone_number", ""),
+                doc.get("created_at", ""),
+            )
+        )
     return rows
 
 
@@ -1465,11 +1355,12 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def broadcast_message(context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users")
-    user_ids = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    db = get_db()
+    user_ids = [
+        doc["user_id"]
+        for doc in db.users.find({}, {"user_id": 1})
+        if doc.get("user_id") is not None
+    ]
 
     sent = 0
     for uid in user_ids:
@@ -2455,22 +2346,20 @@ async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     otp_code = " ".join(context.args[1:]).strip()
     countries = get_all_countries()
 
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT user_id, country_code, phone_number, status FROM orders WHERE id = ?",
-        (order_id,),
-    )
-    row = cursor.fetchone()
-    conn.close()
+    db = get_db()
+    doc = db.orders.find_one({"id": order_id})
 
-    if not row:
+    if not doc:
         await update.message.reply_text(
             f"❌ Order `#{order_id}` পাওয়া যায়নি।", parse_mode="Markdown"
         )
         return
 
-    user_id, c_code, phone_number, status = row
+    user_id = doc.get("user_id")
+    c_code = doc.get("country_code", "")
+    phone_number = doc.get("phone_number", "")
+    status = doc.get("status", "")
+
     if status != "ACTIVE":
         await update.message.reply_text(
             f"⚠️ Order `#{order_id}` already `{status}`.", parse_mode="Markdown"
@@ -2668,19 +2557,28 @@ async def set_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         countries = get_all_countries()
-        conn = get_conn()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT id, user_id, country_code, phone_number
-            FROM orders
-            WHERE status = 'ACTIVE'
-              AND (julianday('now') - julianday(created_at)) * 86400 >= 10
-            LIMIT 15
-            """
+        db = get_db()
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            seconds=10
         )
-        active_rows = cursor.fetchall()
-        conn.close()
+        active_cursor = db.orders.find(
+            {
+                "status": "ACTIVE",
+                "$or": [
+                    {"created_at": {"$lte": cutoff}},
+                    {"created_at": {"$type": "string"}},
+                ],
+            }
+        ).limit(15)
+        active_rows = [
+            (
+                int(doc["id"]),
+                int(doc["user_id"]),
+                doc.get("country_code", ""),
+                doc.get("phone_number", ""),
+            )
+            for doc in active_cursor
+        ]
 
         for order_id, user_id, c_code, phone_number in active_rows:
             resolved_code = resolve_country_code(c_code)
