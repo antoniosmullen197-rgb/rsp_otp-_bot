@@ -41,43 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BASE_COUNTRIES = {
-    "it": {
-        "name": "Italy",
-        "flag": "🇮🇹",
-        "dial": "+39",
-        "service": "OTP",
-        "rate": 16.50,
-    },
-    "bd": {
-        "name": "Bangladesh",
-        "flag": "🇧🇩",
-        "dial": "+880",
-        "service": "OTP",
-        "rate": 15.00,
-    },
-    "us": {
-        "name": "United States",
-        "flag": "🇺🇸",
-        "dial": "+1",
-        "service": "OTP",
-        "rate": 20.00,
-    },
-    "gb": {
-        "name": "United Kingdom",
-        "flag": "🇬🇧",
-        "dial": "+44",
-        "service": "OTP",
-        "rate": 14.00,
-    },
-    "in": {
-        "name": "India",
-        "flag": "🇮🇳",
-        "dial": "+91",
-        "service": "OTP",
-        "rate": 10.00,
-    },
-}
+BASE_COUNTRIES: dict[str, dict] = {}
 
 
 def get_conn() -> sqlite3.Connection:
@@ -139,7 +103,7 @@ def init_db() -> None:
             full_name TEXT,
             balance REAL DEFAULT 0.0,
             otp_count INTEGER DEFAULT 0,
-            selected_country TEXT DEFAULT 'it',
+            selected_country TEXT DEFAULT '',
             referred_by INTEGER,
             last_req REAL DEFAULT 0,
             joined_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -203,11 +167,19 @@ def init_db() -> None:
     if "otp_count" not in user_cols:
         cursor.execute("ALTER TABLE users ADD COLUMN otp_count INTEGER DEFAULT 0")
     if "selected_country" not in user_cols:
-        cursor.execute("ALTER TABLE users ADD COLUMN selected_country TEXT DEFAULT 'it'")
+        cursor.execute("ALTER TABLE users ADD COLUMN selected_country TEXT DEFAULT ''")
     if "referred_by" not in user_cols:
         cursor.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
     if "last_req" not in user_cols:
         cursor.execute("ALTER TABLE users ADD COLUMN last_req REAL DEFAULT 0")
+
+    for removed_code in ("it", "bd", "us", "gb", "in"):
+        cursor.execute("DELETE FROM country_rates WHERE country_code = ?", (removed_code,))
+        cursor.execute("DELETE FROM custom_countries WHERE country_code = ?", (removed_code,))
+
+    cursor.execute(
+        "UPDATE users SET selected_country = '' WHERE selected_country IN ('it', 'bd', 'us', 'gb', 'in')"
+    )
 
     for code, info in BASE_COUNTRIES.items():
         cursor.execute(
@@ -222,7 +194,6 @@ def init_db() -> None:
         "support_contact": "@reyad0045",
         "support_mode": "LIVE",
         "support_link": "https://t.me/reyad0045",
-        "otp_group": "https://t.me/reyad0045",
         "withdraw_status": "ON",
         "min_withdraw": "50.0",
         "refer_reward": "0.2",
@@ -356,6 +327,8 @@ def delete_custom_country(country_code: str) -> bool:
 
 def resolve_country_code(raw_country) -> str:
     countries = get_all_countries()
+    if not countries:
+        return ""
     if isinstance(raw_country, str):
         val = raw_country.strip().lower()
         if val in countries:
@@ -369,7 +342,7 @@ def resolve_country_code(raw_country) -> str:
                 c_dial_digits = re.sub(r"\D", "", str(info.get("dial", "")))
                 if c_dial_digits and dial_digits.startswith(c_dial_digits):
                     return code
-    return "it" if "it" in countries else next(iter(countries.keys()))
+    return next(iter(countries.keys()))
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -428,6 +401,8 @@ def add_admin_id(new_admin_id: int) -> None:
 def get_country_rate(country_code: str) -> float:
     countries = get_all_countries()
     code = resolve_country_code(country_code)
+    if not code or code not in countries:
+        return 0.0
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT rate FROM country_rates WHERE country_code = ?", (code,))
@@ -440,6 +415,8 @@ def get_country_rate(country_code: str) -> float:
 
 def set_country_rate(country_code: str, rate: float) -> None:
     code = resolve_country_code(country_code)
+    if not code:
+        return
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -460,7 +437,7 @@ def ensure_user(
     full_name: str = "",
     referred_by: int | None = None,
 ) -> bool:
-    default_c = resolve_country_code("it")
+    default_c = resolve_country_code("")
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
@@ -522,7 +499,7 @@ def deduct_all_user_balance(user_id: int) -> float:
 
 def get_user_profile(user_id: int):
     countries = get_all_countries()
-    fallback_c = resolve_country_code("it")
+    fallback_c = resolve_country_code("")
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -551,7 +528,7 @@ def set_user_country(user_id: int, country_code: str) -> None:
 
 
 def create_active_order(user_id: int, country_code: str, phone_number: str) -> int:
-    code = resolve_country_code(country_code)
+    code = resolve_country_code(country_code) or "custom"
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -571,7 +548,7 @@ def complete_order_and_reward(
     order_id: int, user_id: int, country_code: str, otp_code: str
 ) -> float:
     code = resolve_country_code(country_code)
-    rate = get_country_rate(code)
+    rate = get_country_rate(code) if code else 0.0
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
     conn = get_conn()
@@ -796,8 +773,43 @@ def _extract_otp_from_text(text: str) -> str | None:
     return None
 
 
-def call_custom_panel_get_number(panel_row, country_code: str = "it") -> tuple[bool, str, str]:
-    _, pname, api_key, get_num_url, _, _ = panel_row
+def _send_panel_http_request(
+    url: str, api_key: str, method: str = "POST", payload: dict | None = None
+) -> tuple[bool, str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 RSP-OTP-Bot/1.0",
+        "Accept": "application/json, text/plain, */*",
+    }
+    if api_key:
+        headers["mauthapi"] = api_key
+
+    data_bytes = None
+    if method.upper() == "POST":
+        headers["Content-Type"] = "application/json"
+        data_bytes = json.dumps(payload or {}).encode("utf-8")
+
+    req = urllib.request.Request(
+        url, data=data_bytes, headers=headers, method=method.upper()
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", errors="ignore").strip()
+            return True, body
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="ignore").strip()
+        except Exception:
+            pass
+        return False, err_body or f"HTTP {exc.code}"
+    except Exception as exc:
+        return False, f"Request Error: {str(exc)[:120]}"
+
+
+def call_custom_panel_get_number(
+    panel_row, country_code: str = ""
+) -> tuple[bool, str, str]:
+    _, _, api_key, get_num_url, _, _ = panel_row
     if not get_num_url:
         return False, "", "Get Number URL set kora nei."
 
@@ -806,64 +818,56 @@ def call_custom_panel_get_number(panel_row, country_code: str = "it") -> tuple[b
         .replace("{key}", api_key or "")
         .replace("{country}", country_code or "")
     )
-    has_placeholder = any(ph in get_num_url for ph in ("{api_key}", "{key}", "{country}"))
-    if not has_placeholder:
-        extra = {}
-        if api_key:
-            extra["api_key"] = api_key
-        if country_code:
-            extra["country"] = country_code
-        if extra:
-            sep = "&" if "?" in target_url else "?"
-            target_url = f"{target_url}{sep}{urllib.parse.urlencode(extra)}"
+    payload = {"country": country_code} if country_code else {}
 
-    req = urllib.request.Request(
-        target_url,
-        headers={"User-Agent": "Mozilla/5.0 RSP-OTP-Bot/1.0"},
+    ok, body = _send_panel_http_request(
+        target_url, api_key or "", method="POST", payload=payload
     )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read().decode("utf-8", errors="ignore").strip()
-            phone = _extract_phone_from_text(body)
-            if phone:
-                return True, phone, body[:200]
-            return False, "", body[:200] if body else "Panel theke number pawa jayni."
-    except Exception as exc:
-        return False, "", f"Panel Request Error: {str(exc)[:120]}"
+    if not ok:
+        sep = "&" if "?" in target_url else "?"
+        get_url = (
+            f"{target_url}{sep}{urllib.parse.urlencode({'country': country_code})}"
+            if country_code
+            else target_url
+        )
+        ok_get, body_get = _send_panel_http_request(
+            get_url, api_key or "", method="GET"
+        )
+        if ok_get:
+            ok, body = True, body_get
+        else:
+            return False, "", body[:200]
+
+    phone = _extract_phone_from_text(body)
+    if phone:
+        return True, phone, body[:200]
+    return False, "", body[:200] if body else "Panel theke number pawa jayni."
 
 
 def fetch_sms_from_custom_panels(phone_number: str, country_code: str) -> str | None:
-    for _, pname, api_key, _, get_otp_url, status in list_api_panels():
+    for _, _, api_key, _, get_otp_url, status in list_api_panels():
         if str(status).upper() != "ACTIVE" or not get_otp_url:
             continue
+
         target_url = (
             get_otp_url.replace("{api_key}", api_key or "")
             .replace("{key}", api_key or "")
             .replace("{phone}", urllib.parse.quote(phone_number))
             .replace("{country}", urllib.parse.quote(country_code))
         )
-        has_placeholder = any(
-            ph in get_otp_url for ph in ("{api_key}", "{key}", "{phone}", "{country}")
+        payload = {"phone": phone_number, "country": country_code}
+        ok, body = _send_panel_http_request(
+            target_url, api_key or "", method="POST", payload=payload
         )
-        if not has_placeholder:
-            params = {"phone": phone_number, "country": country_code}
-            if api_key:
-                params["api_key"] = api_key
+        if not ok:
             sep = "&" if "?" in target_url else "?"
-            target_url = f"{target_url}{sep}{urllib.parse.urlencode(params)}"
+            get_url = f"{target_url}{sep}{urllib.parse.urlencode({'phone': phone_number, 'country': country_code})}"
+            ok, body = _send_panel_http_request(get_url, api_key or "", method="GET")
 
-        req = urllib.request.Request(
-            target_url,
-            headers={"User-Agent": "Mozilla/5.0 RSP-OTP-Bot/1.0"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                body = resp.read().decode("utf-8", errors="ignore").strip()
-                otp = _extract_otp_from_text(body)
-                if otp:
-                    return otp
-        except Exception:
-            pass
+        if ok:
+            otp = _extract_otp_from_text(body)
+            if otp:
+                return otp
     return None
 
 
@@ -880,10 +884,11 @@ def call_voltex_api(extra_params: dict):
 
     sep = "&" if "?" in api_url else "?"
     target_url = f"{api_url}{sep}{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(
-        target_url,
-        headers={"User-Agent": "Mozilla/5.0 RSP-OTP-Bot/1.0"},
-    )
+    headers = {"User-Agent": "Mozilla/5.0 RSP-OTP-Bot/1.0"}
+    if api_key:
+        headers["mauthapi"] = api_key
+
+    req = urllib.request.Request(target_url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             raw_data = resp.read().decode("utf-8", errors="ignore").strip()
@@ -975,16 +980,49 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🌍 Manage Countries", callback_data="admin_countries_menu"),
-                InlineKeyboardButton("💵 Set Country Rates", callback_data="admin_rates_menu"),
+                InlineKeyboardButton(
+                    "🌍 Manage Countries", callback_data="admin_countries_menu"
+                ),
+                InlineKeyboardButton(
+                    "💵 Set Country Rates", callback_data="admin_rates_menu"
+                ),
             ],
-            [InlineKeyboardButton("⚙️ System Settings", callback_data="admin_sys_settings")],
-            [InlineKeyboardButton("🌐 API Panel Manager", callback_data="admin_api_panels")],
-            [InlineKeyboardButton("📤 Stock & Numbers", callback_data="admin_stock_menu")],
-            [InlineKeyboardButton("🎧 Support Mode", callback_data="admin_support_menu")],
-            [InlineKeyboardButton("🎨 Edit Bot Texts", callback_data="admin_texts_menu")],
-            [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast")],
-            [InlineKeyboardButton("👑 Announce Today's Winner", callback_data="admin_announce_winner")],
+            [
+                InlineKeyboardButton(
+                    "⚙️ System Settings", callback_data="admin_sys_settings"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🌐 API Panel Manager", callback_data="admin_api_panels"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📤 Stock & Numbers", callback_data="admin_stock_menu"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🎧 Support Mode", callback_data="admin_support_menu"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🎨 Edit Bot Texts", callback_data="admin_texts_menu"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📢 Broadcast Message", callback_data="admin_broadcast"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "👑 Announce Today's Winner",
+                    callback_data="admin_announce_winner",
+                )
+            ],
         ]
     )
 
@@ -998,18 +1036,34 @@ def admin_system_settings_keyboard() -> InlineKeyboardMarkup:
     n_shr = get_setting("num_per_share", "1")
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"💳 WITHDRAW: {w_stat}", callback_data="adm_tog_withdraw")],
             [
-                InlineKeyboardButton(f"💸 MIN W.: {min_w}", callback_data="adm_set_min_withdraw"),
-                InlineKeyboardButton(f"🎁 REFER: {ref_r}", callback_data="adm_set_refer_reward"),
+                InlineKeyboardButton(
+                    f"💳 WITHDRAW: {w_stat}", callback_data="adm_tog_withdraw"
+                )
             ],
             [
-                InlineKeyboardButton(f"⏳ COOLDOWN: {cd}s", callback_data="adm_set_cooldown"),
-                InlineKeyboardButton(f"📞 NUM/REQ: {n_req}", callback_data="adm_set_num_per_req"),
+                InlineKeyboardButton(
+                    f"💸 MIN W.: {min_w}", callback_data="adm_set_min_withdraw"
+                ),
+                InlineKeyboardButton(
+                    f"🎁 REFER: {ref_r}", callback_data="adm_set_refer_reward"
+                ),
             ],
             [
-                InlineKeyboardButton(f"🔢 NUM/SHARE: {n_shr}", callback_data="adm_set_num_per_share"),
-                InlineKeyboardButton("🏦 W. METHODS", callback_data="adm_set_withdraw_methods"),
+                InlineKeyboardButton(
+                    f"⏳ COOLDOWN: {cd}s", callback_data="adm_set_cooldown"
+                ),
+                InlineKeyboardButton(
+                    f"📞 NUM/REQ: {n_req}", callback_data="adm_set_num_per_req"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"🔢 NUM/SHARE: {n_shr}", callback_data="adm_set_num_per_share"
+                ),
+                InlineKeyboardButton(
+                    "🏦 W. METHODS", callback_data="adm_set_withdraw_methods"
+                ),
             ],
             [InlineKeyboardButton("➕ Add Admin ID", callback_data="adm_add_admin")],
         ]
@@ -1035,7 +1089,11 @@ def admin_rate_countries_keyboard() -> InlineKeyboardMarkup:
 def admin_manage_countries_keyboard() -> InlineKeyboardMarkup:
     countries = get_all_countries()
     rows = [
-        [InlineKeyboardButton("➕ Add New Country", callback_data="add_country_start")]
+        [
+            InlineKeyboardButton(
+                "➕ Add New Country", callback_data="add_country_start"
+            )
+        ]
     ]
     for code, info in countries.items():
         rate = get_country_rate(code)
@@ -1051,7 +1109,7 @@ def admin_manage_countries_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def number_card_keyboard(country_code: str, otp_group: str) -> InlineKeyboardMarkup:
+def number_card_keyboard(country_code: str) -> InlineKeyboardMarkup:
     rows = []
 
     stock_rows = get_number_stock_summary("unused")
@@ -1066,19 +1124,30 @@ def number_card_keyboard(country_code: str, otp_group: str) -> InlineKeyboardMar
 
     for pid, pname, _, _, _, _ in list_api_panels():
         rows.append(
-            [InlineKeyboardButton(f"⚡ {pname} (Panel API)", callback_data=f"pickpanel_{pid}")]
+            [
+                InlineKeyboardButton(
+                    f"⚡ {pname} (Panel API)", callback_data=f"pickpanel_{pid}"
+                )
+            ]
         )
 
-    rows.append(
-        [
-            InlineKeyboardButton("🔄 Refresh Stock", callback_data=f"change_{country_code}"),
-            InlineKeyboardButton("🌍 Country", callback_data="countries_menu"),
-        ]
-    )
-    if otp_group.startswith("http"):
-        rows.append([InlineKeyboardButton("💬 OTP Group", url=otp_group)])
+    if get_all_countries():
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🔄 Refresh Stock", callback_data=f"change_{country_code}"
+                ),
+                InlineKeyboardButton("🌍 Country", callback_data="countries_menu"),
+            ]
+        )
     else:
-        rows.append([InlineKeyboardButton("💬 OTP Group", callback_data="otp_group_info")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🔄 Refresh Stock", callback_data="change_none"
+                )
+            ]
+        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -1108,12 +1177,10 @@ async def send_number_card(
     _, _, current_country = get_user_profile(user_id)
     candidate = country_code if country_code else current_country
     code = resolve_country_code(candidate)
-    set_user_country(user_id, code)
+    if code:
+        set_user_country(user_id, code)
 
-    info = countries[code]
-    rate = get_country_rate(code)
     now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
-    otp_group = get_setting("otp_group", "https://t.me/reyad0045")
     stock_rows = get_number_stock_summary("unused")
     panels = list_api_panels()
 
@@ -1121,30 +1188,44 @@ async def send_number_card(
     active_note = ""
     if active_orders:
         active_items = [
-            f"• Order `#{oid}`: `{ph}` ({resolve_country_code(cc).upper()})"
+            f"• Order `#{oid}`: `{ph}` ({resolve_country_code(cc).upper() or 'CUSTOM'})"
             for oid, cc, ph, _ in active_orders[:3]
         ]
-        active_note = "\n\n⏳ **চলমান নম্বর (OTP অপেক্ষমাণ):**\n" + "\n".join(active_items)
+        active_note = "\n\n⏳ **চলমান নম্বর (OTP অপেক্ষমাণ):**\n" + "\n".join(
+            active_items
+        )
 
     custom_header = get_setting("text_get_num", "")
     if not stock_rows and not panels:
         body_note = "❌ বর্তমানে স্টকে কোনো নম্বর বা কাস্টম প্যানেল নেই। অ্যাডমিন নম্বর আপলোড বা প্যানেল যুক্ত করলে এখানে দেখাবে।"
     else:
-        body_note = custom_header if custom_header else "নিচের স্টক বা প্যানেল থেকে নম্বর নিন:"
+        body_note = (
+            custom_header if custom_header else "নিচের স্টক বা প্যানেল থেকে নম্বর নিন:"
+        )
 
-    card_text = (
-        f"╔══════════════════════╗\n"
-        f"  {info['flag']} **{info['name']} ({info['dial']})**\n"
-        f"  📱 **{info['service']}** • 💵 **৳{rate:.2f}**\n"
-        f"  🕒 **Updated:** `{now_str}`\n"
-        f"╚══════════════════════╝\n"
-        f"{body_note}{active_note}"
-    )
+    if code and code in countries:
+        info = countries[code]
+        rate = get_country_rate(code)
+        header_block = (
+            f"╔══════════════════════╗\n"
+            f"  {info['flag']} **{info['name']} ({info['dial']})**\n"
+            f"  📱 **{info['service']}** • 💵 **৳{rate:.2f}**\n"
+            f"  🕒 **Updated:** `{now_str}`\n"
+            f"╚══════════════════════╝\n"
+        )
+    else:
+        header_block = (
+            f"╔══════════════════════╗\n"
+            f"  🌍 **No Country Added Yet**\n"
+            f"  🕒 **Updated:** `{now_str}`\n"
+            f"╚══════════════════════╝\n"
+        )
+
     await context.bot.send_message(
         chat_id=chat_id,
-        text=card_text,
+        text=f"{header_block}{body_note}{active_note}",
         parse_mode="Markdown",
-        reply_markup=number_card_keyboard(code, otp_group),
+        reply_markup=number_card_keyboard(code),
     )
 
 
@@ -1156,7 +1237,9 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
 
     panel_data, status_label = fetch_panel_traffic()
     completed_counts = get_real_completed_order_counts()
-    custom_traffic_hdr = get_setting("text_traffic", "📊 **Real-Time Stock & Order Stats**")
+    custom_traffic_hdr = get_setting(
+        "text_traffic", "📊 **Real-Time Stock & Order Stats**"
+    )
 
     unused_rows = get_number_stock_summary("unused")
     used_rows = get_number_stock_summary("used")
@@ -1172,27 +1255,31 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
         f"🔑 **API Key:** `{'Set' if api_key else 'Not Set'}`",
         f"📡 **API Status:** `{status_label}`",
         f"🕒 **Updated:** `{now_str}`",
-        "",
-        "**Country Rates & Completed OTPs:**",
     ]
 
-    for code, info in countries.items():
-        rate = get_country_rate(code)
-        done_cnt = completed_counts.get(code, 0)
-        api_stat = ""
-        if (
-            isinstance(panel_data, dict)
-            and code in panel_data
-            and isinstance(panel_data[code], dict)
-        ):
-            val = panel_data[code].get("count", panel_data[code].get("traffic"))
-            if val is not None:
-                api_stat = f" • API: `{val}`"
+    if countries:
+        lines.append("")
+        lines.append("**Country Rates & Completed OTPs:**")
+        for code, info in countries.items():
+            rate = get_country_rate(code)
+            done_cnt = completed_counts.get(code, 0)
+            api_stat = ""
+            if (
+                isinstance(panel_data, dict)
+                and code in panel_data
+                and isinstance(panel_data[code], dict)
+            ):
+                val = panel_data[code].get("count", panel_data[code].get("traffic"))
+                if val is not None:
+                    api_stat = f" • API: `{val}`"
 
-        lines.append(
-            f"• {info['flag']} **{info['name']} (`{info['dial']}`):** "
-            f"৳`{rate:.2f}` • Completed OTPs: `{done_cnt}`{api_stat}"
-        )
+            lines.append(
+                f"• {info['flag']} **{info['name']} (`{info['dial']}`):** "
+                f"৳`{rate:.2f}` • Completed OTPs: `{done_cnt}`{api_stat}"
+            )
+    else:
+        lines.append("")
+        lines.append("ℹ️ কোনো country যোগ করা হয়নি। অ্যাডমিন `/addcountry` বা Manage Countries থেকে যোগ করতে পারেন।")
 
     if unused_rows:
         lines.append("")
@@ -1264,10 +1351,14 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else ("Set" if api_key else "Not Set")
     )
 
-    rate_lines = [
-        f"  • `{code}` ({info['name']}): **৳{get_country_rate(code):.2f}**"
-        for code, info in countries.items()
-    ]
+    rate_lines = (
+        [
+            f"  • `{code}` ({info['name']}): **৳{get_country_rate(code):.2f}**"
+            for code, info in countries.items()
+        ]
+        if countries
+        else ["  • No country added yet"]
+    )
 
     panel_text = (
         f"🛠️ **Admin Panel**\n\n"
@@ -1325,16 +1416,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     countries = get_all_countries()
     bot_name = get_setting("bot_name", "RSP OTP BOT")
     balance, otp_count, country_code = get_user_profile(user.id)
-    c_info = countries[country_code]
     custom_start = get_setting("text_start", "")
 
     if custom_start:
         welcome_text = custom_start
     else:
+        if country_code and country_code in countries:
+            c_info = countries[country_code]
+            c_line = f"🌍 **Selected Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)"
+        else:
+            c_line = "🌍 **Selected Country:** Not Added Yet"
         welcome_text = (
             f"👋 Welcome to **{bot_name}**!\n\n"
             f"📊 **OTPs:** `{otp_count}` • 💰 **Balance:** `৳{balance:.2f}`\n"
-            f"🌍 **Selected Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)"
+            f"{c_line}"
         )
     await update.message.reply_text(
         welcome_text,
@@ -1382,7 +1477,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         orig_txt = update.message.reply_to_message.text or ""
         if "User ID:" in orig_txt:
             try:
-                target_str = orig_txt.split("User ID:", 1)[1].strip().split()[0].strip("`*")
+                target_str = (
+                    orig_txt.split("User ID:", 1)[1].strip().split()[0].strip("`*")
+                )
                 target_uid = int(target_str)
                 await context.bot.send_message(
                     chat_id=target_uid,
@@ -1399,21 +1496,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if country_step == "code":
             cleaned_code = re.sub(r"[^a-z0-9_]", "", text.lower())
             if not cleaned_code:
-                await update.message.reply_text("⚠️ সঠিক short code দিন (যেমন: `be`, `de`, `ca`):")
+                await update.message.reply_text(
+                    "⚠️ সঠিক short code দিন (যেমন: `be`, `de`, `ca`):"
+                )
                 return
             context.user_data["country_draft"] = {"code": cleaned_code}
             context.user_data["country_add_step"] = "name"
-            await update.message.reply_text("2️⃣ দেশের নাম লিখুন (যেমন: `Belgium`):", parse_mode="Markdown")
+            await update.message.reply_text(
+                "2️⃣ দেশের নাম লিখুন (যেমন: `Belgium`):", parse_mode="Markdown"
+            )
             return
         elif country_step == "name":
             context.user_data["country_draft"]["name"] = text
             context.user_data["country_add_step"] = "dial"
-            await update.message.reply_text("3️⃣ Dial Code লিখুন (যেমন: `+32`):", parse_mode="Markdown")
+            await update.message.reply_text(
+                "3️⃣ Dial Code লিখুন (যেমন: `+32`):", parse_mode="Markdown"
+            )
             return
         elif country_step == "dial":
             context.user_data["country_draft"]["dial"] = text
             context.user_data["country_add_step"] = "rate"
-            await update.message.reply_text("4️⃣ প্রতি OTP-তে কত টাকা (৳) দিবেন? সংখ্যা লিখুন (যেমন: `18.00`):", parse_mode="Markdown")
+            await update.message.reply_text(
+                "4️⃣ প্রতি OTP-তে কত টাকা (৳) দিবেন? সংখ্যা লিখুন (যেমন: `18.00`):",
+                parse_mode="Markdown",
+            )
             return
         elif country_step == "rate":
             try:
@@ -1538,7 +1644,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if panel_step == "name":
             context.user_data["panel_draft"] = {"name": text}
             context.user_data["panel_add_step"] = "key"
-            await update.message.reply_text("2️⃣ প্যানেলের **API Key** লিখুন:", parse_mode="Markdown")
+            await update.message.reply_text(
+                "2️⃣ প্যানেলের **API Key** লিখুন:", parse_mode="Markdown"
+            )
             return
         elif panel_step == "key":
             context.user_data["panel_draft"]["key"] = text
@@ -1666,7 +1774,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if m.strip()
         ]
         kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(f"💳 {m}", callback_data=f"wdmeth_{m}")] for m in methods]
+            [
+                [InlineKeyboardButton(f"💳 {m}", callback_data=f"wdmeth_{m}")]
+                for m in methods
+            ]
         )
         await update.message.reply_text(
             f"{msg_txt}\n\nপেমেন্ট মেথড সিলেক্ট করুন:",
@@ -1703,7 +1814,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             buttons.append([InlineKeyboardButton("📞 Contact Support", url=link)])
         if mode in ("LIVE", "BOTH"):
             buttons.append(
-                [InlineKeyboardButton("💬 Start Live Chat", callback_data="user_live_chat")]
+                [
+                    InlineKeyboardButton(
+                        "💬 Start Live Chat", callback_data="user_live_chat"
+                    )
+                ]
             )
         if mode == "LIVE" and not buttons:
             context.user_data["in_live_support"] = True
@@ -1778,12 +1893,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         c_code = data.replace("del_country_", "", 1)
         if delete_custom_country(c_code):
-            await query.message.reply_text(f"✅ `{c_code}` দেশটি ডিলিট করা হয়েছে।", parse_mode="Markdown")
+            await query.message.reply_text(
+                f"✅ `{c_code}` দেশটি ডিলিট করা হয়েছে।", parse_mode="Markdown"
+            )
         else:
             await query.message.reply_text("⚠️ ডিফল্ট দেশ ডিলিট করা যাবে না।")
 
     elif data == "admin_rates_menu":
         if not is_admin(user.id):
+            return
+        if not countries:
+            await query.message.reply_text("⚠️ এখনো কোনো country যোগ করা হয়নি।")
             return
         await query.message.reply_text(
             "💵 **Select a country to set rate (৳):**",
@@ -1819,7 +1939,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         curr = get_setting("withdraw_status", "ON")
         set_setting("withdraw_status", "OFF" if curr == "ON" else "ON")
-        await query.message.edit_reply_markup(reply_markup=admin_system_settings_keyboard())
+        await query.message.edit_reply_markup(
+            reply_markup=admin_system_settings_keyboard()
+        )
 
     elif data.startswith("adm_set_"):
         if not is_admin(user.id):
@@ -1841,7 +1963,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         panels = list_api_panels()
         rows = [
-            [InlineKeyboardButton("➕ Add New Panel API", callback_data="panel_add_start")]
+            [
+                InlineKeyboardButton(
+                    "➕ Add New Panel API", callback_data="panel_add_start"
+                )
+            ]
         ]
         for pid, pname, _, _, _, st in panels:
             rows.append(
@@ -1861,7 +1987,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not is_admin(user.id):
             return
         context.user_data["panel_add_step"] = "name"
-        await query.message.reply_text("1️⃣ প্যানেলের নাম লিখুন (যেমন: `Voltx` বা `5sim`):", parse_mode="Markdown")
+        await query.message.reply_text(
+            "1️⃣ প্যানেলের নাম লিখুন (যেমন: `Voltx` বা `5sim`):", parse_mode="Markdown"
+        )
 
     elif data.startswith("panel_del_"):
         if not is_admin(user.id):
@@ -1879,8 +2007,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         d_txt = ", ".join(f"{c}: {n}" for c, n in used_rows) or "None"
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("📤 Upload Numbers", callback_data="stock_upload_start")],
-                [InlineKeyboardButton("🗑 Delete All Stock", callback_data="stock_clear_all")],
+                [
+                    InlineKeyboardButton(
+                        "📤 Upload Numbers", callback_data="stock_upload_start"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🗑 Delete All Stock", callback_data="stock_clear_all"
+                    )
+                ],
             ]
         )
         await query.message.reply_text(
@@ -1893,7 +2029,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not is_admin(user.id):
             return
         context.user_data["awaiting_upload_country"] = True
-        await query.message.reply_text("🌍 কোন দেশের নম্বর আপলোড করবেন? দেশের নাম লিখুন:")
+        await query.message.reply_text(
+            "🌍 কোন দেশের নম্বর আপলোড করবেন? দেশের নাম লিখুন:"
+        )
 
     elif data == "stock_clear_all":
         if not is_admin(user.id):
@@ -1908,11 +2046,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         kb = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(f"Normal {'✅' if mode=='NORMAL' else ''}", callback_data="supmode_NORMAL"),
-                    InlineKeyboardButton(f"Live {'✅' if mode=='LIVE' else ''}", callback_data="supmode_LIVE"),
-                    InlineKeyboardButton(f"Both {'✅' if mode=='BOTH' else ''}", callback_data="supmode_BOTH"),
+                    InlineKeyboardButton(
+                        f"Normal {'✅' if mode=='NORMAL' else ''}",
+                        callback_data="supmode_NORMAL",
+                    ),
+                    InlineKeyboardButton(
+                        f"Live {'✅' if mode=='LIVE' else ''}",
+                        callback_data="supmode_LIVE",
+                    ),
+                    InlineKeyboardButton(
+                        f"Both {'✅' if mode=='BOTH' else ''}",
+                        callback_data="supmode_BOTH",
+                    ),
                 ],
-                [InlineKeyboardButton("🔗 Set Support Link", callback_data="adm_set_support_link")],
+                [
+                    InlineKeyboardButton(
+                        "🔗 Set Support Link", callback_data="adm_set_support_link"
+                    )
+                ],
             ]
         )
         await query.message.reply_text(
@@ -1926,19 +2077,45 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         new_m = data.replace("supmode_", "", 1)
         set_setting("support_mode", new_m)
-        await query.message.reply_text(f"✅ Support Mode set to `{new_m}`.", parse_mode="Markdown")
+        await query.message.reply_text(
+            f"✅ Support Mode set to `{new_m}`.", parse_mode="Markdown"
+        )
 
     elif data == "admin_texts_menu":
         if not is_admin(user.id):
             return
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("✏️ /start Text", callback_data="adm_set_text_start")],
-                [InlineKeyboardButton("📱 Get Number Text", callback_data="adm_set_text_get_num")],
-                [InlineKeyboardButton("📊 Traffic Text", callback_data="adm_set_text_traffic")],
-                [InlineKeyboardButton("🎁 Refer Text", callback_data="adm_set_text_refer")],
-                [InlineKeyboardButton("💳 Withdraw Text", callback_data="adm_set_text_withdraw")],
-                [InlineKeyboardButton("🎧 Support Text", callback_data="adm_set_text_support")],
+                [
+                    InlineKeyboardButton(
+                        "✏️ /start Text", callback_data="adm_set_text_start"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📱 Get Number Text", callback_data="adm_set_text_get_num"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📊 Traffic Text", callback_data="adm_set_text_traffic"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🎁 Refer Text", callback_data="adm_set_text_refer"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "💳 Withdraw Text", callback_data="adm_set_text_withdraw"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🎧 Support Text", callback_data="adm_set_text_support"
+                    )
+                ],
             ]
         )
         await query.message.reply_text(
@@ -1967,13 +2144,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         _, phone_num = picked
         matched_code = resolve_country_code(c_name)
-        c_info = countries[matched_code]
+        if matched_code and matched_code in countries:
+            c_info = countries[matched_code]
+            country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
+        else:
+            country_line = ""
         rate = get_country_rate(matched_code)
         order_id = create_active_order(user.id, matched_code, phone_num)
         await query.message.reply_text(
             f"✅ **Stock Number Assigned!**\n\n"
             f"🧾 **Order ID:** `#{order_id}`\n"
-            f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
+            f"{country_line}"
             f"📦 **Stock:** **{c_name}**\n"
             f"📱 **Phone:** `{phone_num}`\n"
             f"💵 **Rate:** `৳{rate:.2f}`\n"
@@ -1995,14 +2176,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 parse_mode="Markdown",
             )
             return
-        detected_code = resolve_country_code(phone_num) if phone_num.startswith("+") else active_code
-        c_info = countries[detected_code]
+        detected_code = (
+            resolve_country_code(phone_num) if phone_num.startswith("+") else active_code
+        )
+        if detected_code and detected_code in countries:
+            c_info = countries[detected_code]
+            country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
+        else:
+            country_line = ""
         rate = get_country_rate(detected_code)
         order_id = create_active_order(user.id, detected_code, phone_num)
         await query.message.reply_text(
             f"✅ **Panel Number Assigned!**\n\n"
             f"🧾 **Order ID:** `#{order_id}`\n"
-            f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
+            f"{country_line}"
             f"⚡ **Panel:** **{panel[1]}**\n"
             f"📱 **Phone:** `{phone_num}`\n"
             f"💵 **Rate:** `৳{rate:.2f}`\n"
@@ -2011,12 +2198,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
     elif data.startswith("change_"):
-        c_code = resolve_country_code(data.replace("change_", "", 1))
+        raw_c = data.replace("change_", "", 1)
+        c_code = "" if raw_c == "none" else resolve_country_code(raw_c)
         await send_number_card(
             query.message.chat_id, user.id, context, country_code=c_code
         )
 
     elif data == "countries_menu":
+        if not countries:
+            await query.message.reply_text("⚠️ এখনো কোনো country যোগ করা হয়নি।")
+            return
         await query.message.reply_text(
             "🌍 **Select Country & Dial Code:**",
             parse_mode="Markdown",
@@ -2037,13 +2228,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 query.message.chat_id, user.id, context, country_code=c_code
             )
 
-    elif data == "otp_group_info":
-        support = get_setting("support_contact", "@reyad0045")
-        await query.message.reply_text(f"💬 OTP Group / Support: {support}")
-
 
 async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+    if (
+        not update.effective_user
+        or not update.message
+        or not is_admin(update.effective_user.id)
+    ):
         return
     if len(context.args) < 2 or not context.args[0].isdigit():
         await update.message.reply_text(
@@ -2065,17 +2256,25 @@ async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     conn.close()
 
     if not row:
-        await update.message.reply_text(f"❌ Order `#{order_id}` পাওয়া যায়নি।", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"❌ Order `#{order_id}` পাওয়া যায়নি।", parse_mode="Markdown"
+        )
         return
 
     user_id, c_code, phone_number, status = row
     if status != "ACTIVE":
-        await update.message.reply_text(f"⚠️ Order `#{order_id}` already `{status}`.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"⚠️ Order `#{order_id}` already `{status}`.", parse_mode="Markdown"
+        )
         return
 
     resolved_code = resolve_country_code(c_code)
     reward = complete_order_and_reward(order_id, int(user_id), resolved_code, otp_code)
-    c_info = countries[resolved_code]
+    if resolved_code and resolved_code in countries:
+        c_info = countries[resolved_code]
+        country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
+    else:
+        country_line = ""
 
     try:
         await context.bot.send_message(
@@ -2083,7 +2282,7 @@ async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             text=(
                 f"📩 **OTP Received!**\n\n"
                 f"🧾 **Order ID:** `#{order_id}`\n"
-                f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
+                f"{country_line}"
                 f"📱 **Phone:** `{phone_number}`\n"
                 f"🔐 **Code:** `{otp_code}`\n"
                 f"💵 **Earned:** `+৳{reward:.2f}`"
@@ -2095,11 +2294,17 @@ async def send_otp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode="Markdown",
         )
     except Exception as exc:
-        await update.message.reply_text(f"⚠️ মেসেজ পাঠাতে সমস্যা: `{exc}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"⚠️ মেসেজ পাঠাতে সমস্যা: `{exc}`", parse_mode="Markdown"
+        )
 
 
 async def add_country_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+    if (
+        not update.effective_user
+        or not update.message
+        or not is_admin(update.effective_user.id)
+    ):
         return
     if len(context.args) < 4:
         await update.message.reply_text(
@@ -2139,11 +2344,15 @@ async def add_country_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def set_rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+    if (
+        not update.effective_user
+        or not update.message
+        or not is_admin(update.effective_user.id)
+    ):
         return
     countries = get_all_countries()
     if len(context.args) < 2:
-        avail = ", ".join(f"`{k}`" for k in countries.keys())
+        avail = ", ".join(f"`{k}`" for k in countries.keys()) or "None"
         await update.message.reply_text(
             f"Usage: `/setrate <code> <amount>`\nAvailable: {avail}",
             parse_mode="Markdown",
@@ -2151,7 +2360,7 @@ async def set_rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     c_code = context.args[0].strip().lower()
     if c_code not in countries:
-        avail = ", ".join(f"`{k}`" for k in countries.keys())
+        avail = ", ".join(f"`{k}`" for k in countries.keys()) or "None"
         await update.message.reply_text(
             f"Invalid country code. Available: {avail}",
             parse_mode="Markdown",
@@ -2174,11 +2383,17 @@ async def set_rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def set_bot_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+    if (
+        not update.effective_user
+        or not update.message
+        or not is_admin(update.effective_user.id)
+    ):
         return
     new_name = " ".join(context.args).strip()
     if not new_name:
-        await update.message.reply_text("Usage: `/setname RSP OTP BOT`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Usage: `/setname RSP OTP BOT`", parse_mode="Markdown"
+        )
         return
     set_setting("bot_name", new_name)
     await update.message.reply_text(
@@ -2187,7 +2402,11 @@ async def set_bot_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def set_api_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+    if (
+        not update.effective_user
+        or not update.message
+        or not is_admin(update.effective_user.id)
+    ):
         return
     if not context.args:
         await update.message.reply_text(
@@ -2200,7 +2419,11 @@ async def set_api_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+    if (
+        not update.effective_user
+        or not update.message
+        or not is_admin(update.effective_user.id)
+    ):
         return
     if not context.args:
         await update.message.reply_text(
@@ -2213,7 +2436,11 @@ async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def set_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+    if (
+        not update.effective_user
+        or not update.message
+        or not is_admin(update.effective_user.id)
+    ):
         return
     if not context.args:
         await update.message.reply_text(
@@ -2241,16 +2468,22 @@ async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not otp_code:
             continue
 
-        reward = complete_order_and_reward(int(order_id), int(user_id), resolved_code, otp_code)
-        if reward >= 0:
-            c_info = countries[resolved_code]
+        reward = complete_order_and_reward(
+            int(order_id), int(user_id), resolved_code, otp_code
+        )
+        if reward > 0:
+            if resolved_code and resolved_code in countries:
+                c_info = countries[resolved_code]
+                country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
+            else:
+                country_line = ""
             try:
                 await context.bot.send_message(
                     chat_id=int(user_id),
                     text=(
                         f"📩 **OTP Received!**\n\n"
                         f"🧾 **Order ID:** `#{order_id}`\n"
-                        f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
+                        f"{country_line}"
                         f"📱 **Phone:** `{phone_number}`\n"
                         f"🔐 **Code:** `{otp_code}`\n"
                         f"💵 **Earned:** `+৳{reward:.2f}`"
