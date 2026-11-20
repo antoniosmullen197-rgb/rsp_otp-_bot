@@ -46,7 +46,9 @@ BASE_COUNTRIES: dict[str, dict] = {}
 
 
 def get_conn() -> sqlite3.Connection:
-    return sqlite3.connect(DB_NAME, timeout=15)
+    conn = sqlite3.connect(DB_NAME, timeout=20, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
 
 
 def init_db() -> None:
@@ -908,7 +910,7 @@ def _send_panel_http_request(
         url, data=data_bytes, headers=headers, method=method.upper()
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             body = resp.read().decode("utf-8", errors="ignore").strip()
             return True, body
     except urllib.error.HTTPError as exc:
@@ -1033,7 +1035,7 @@ def call_voltex_api(extra_params: dict):
 
     req = urllib.request.Request(target_url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             raw_data = resp.read().decode("utf-8", errors="ignore").strip()
             if not raw_data:
                 return None, "Empty Response"
@@ -2664,62 +2666,70 @@ async def set_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
-    countries = get_all_countries()
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT id, user_id, country_code, phone_number
-        FROM orders
-        WHERE status = 'ACTIVE'
-          AND (julianday('now') - julianday(created_at)) * 86400 >= 10
-        LIMIT 25
-        """
-    )
-    active_rows = cursor.fetchall()
-    conn.close()
-
-    for order_id, user_id, c_code, phone_number in active_rows:
-        resolved_code = resolve_country_code(c_code)
-        otp_code = fetch_sms_from_panel(phone_number, resolved_code)
-        if not otp_code:
-            continue
-
-        reward = complete_order_and_reward(
-            int(order_id), int(user_id), resolved_code, otp_code
+    try:
+        countries = get_all_countries()
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, user_id, country_code, phone_number
+            FROM orders
+            WHERE status = 'ACTIVE'
+              AND (julianday('now') - julianday(created_at)) * 86400 >= 10
+            LIMIT 15
+            """
         )
-        if reward >= 0:
-            if resolved_code and resolved_code in countries:
-                c_info = countries[resolved_code]
-                country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
-            else:
-                country_line = ""
-            try:
-                await context.bot.send_message(
-                    chat_id=int(user_id),
-                    text=(
-                        f"📩 **OTP Received!**\n\n"
-                        f"🧾 **Order ID:** `#{order_id}`\n"
-                        f"{country_line}"
-                        f"📱 **Phone:** `{phone_number}`\n"
-                        f"🔐 **Code:** `{otp_code}`\n"
-                        f"💵 **Earned:** `+৳{reward:.2f}`"
-                    ),
-                    parse_mode="Markdown",
-                )
-            except Exception as exc:
-                logger.warning("Failed to send OTP message to %s: %s", user_id, exc)
+        active_rows = cursor.fetchall()
+        conn.close()
+
+        for order_id, user_id, c_code, phone_number in active_rows:
+            resolved_code = resolve_country_code(c_code)
+            otp_code = await asyncio.to_thread(
+                fetch_sms_from_panel, phone_number, resolved_code
+            )
+            if not otp_code:
+                continue
+
+            reward = complete_order_and_reward(
+                int(order_id), int(user_id), resolved_code, otp_code
+            )
+            if reward >= 0:
+                if resolved_code and resolved_code in countries:
+                    c_info = countries[resolved_code]
+                    country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']}\n"
+                else:
+                    country_line = ""
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"📩 **OTP Received!**\n\n"
+                            f"🧾 **Order ID:** `#{order_id}`\n"
+                            f"{country_line}"
+                            f"📱 **Phone:** `{phone_number}`\n"
+                            f"🔐 **Code:** `{otp_code}`\n"
+                            f"💵 **Earned:** `+৳{reward:.2f}`"
+                        ),
+                        parse_mode="Markdown",
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to send OTP message to %s: %s", user_id, exc)
+    except Exception as exc:
+        logger.error("job_poll_otps error: %s", exc)
 
 
 async def job_daily_winner_announce(context: ContextTypes.DEFAULT_TYPE) -> None:
-    now = datetime.datetime.now()
-    today_str = now.strftime("%Y-%m-%d")
-    if now.hour == 23 and now.minute >= 55:
-        if get_setting("last_winner_date", "") == today_str:
-            return
-        announced, _ = await announce_daily_winner(context, today_str)
-        if announced:
-            set_setting("last_winner_date", today_str)
+    try:
+        now = datetime.datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        if now.hour == 23 and now.minute >= 55:
+            if get_setting("last_winner_date", "") == today_str:
+                return
+            announced, _ = await announce_daily_winner(context, today_str)
+            if announced:
+                set_setting("last_winner_date", today_str)
+    except Exception as exc:
+        logger.error("job_daily_winner_announce error: %s", exc)
 
 
 web_app = Flask(__name__)
@@ -2728,6 +2738,12 @@ web_app = Flask(__name__)
 @web_app.route("/")
 def home():
     return "RSP OTP Bot is running!", 200
+
+
+@web_app.route("/health")
+@web_app.route("/ping")
+def health():
+    return "OK", 200
 
 
 def run_web_server() -> None:
