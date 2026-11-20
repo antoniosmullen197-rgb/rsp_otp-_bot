@@ -3,6 +3,9 @@ from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 import sqlite3
 import requests
 import time
+import os
+import threading
+from flask import Flask
 
 # ================= CONFIGURATION =================
 BOT_TOKEN = "9178685196:AAGnHHXm7at9Pt8IWIW-zPdiOPkl564dl3U"
@@ -170,7 +173,6 @@ def back_to_user(message):
     user_states[message.from_user.id] = None
     bot.send_message(message.chat.id, "ইউজার মেনুতে ফিরে আসা হয়েছে।", reply_markup=main_menu_kb(message.from_user.id))
 
-# --- GET NUMBER ---
 @bot.message_handler(func=lambda m: m.text == "📱 GET NUMBER")
 def user_get_number(message):
     user_id = message.from_user.id
@@ -272,7 +274,6 @@ def claim_local_otp(call):
     conn.close()
     bot.edit_message_text(f"🎉 অভিনন্দন! আপনার ব্যালেন্সে <b>{reward}</b> টাকা যুক্ত হয়েছে।", call.message.chat.id, call.message.message_id)
 
-# --- BALANCE, REFER, TRAFFIC, WITHDRAWAL ---
 @bot.message_handler(func=lambda m: m.text == "💰 BALANCE")
 def user_balance(message):
     conn = sqlite3.connect(DB_NAME)
@@ -340,7 +341,6 @@ def process_wd_method(call):
     user_states[user_id] = f"wd_number_{method}"
     bot.send_message(user_id, f"📝 আপনার <b>{method}</b> অ্যাকাউন্ট নম্বর এবং পরিমাণ লিখুন (যেমন: <code>017XXXXXXXX - 50</code>):")
 
-# --- SUPPORT SYSTEM ---
 @bot.message_handler(func=lambda m: m.text == "🎧 SUPPORT")
 def user_support(message):
     mode = get_setting("support_mode")
@@ -683,7 +683,21 @@ def handle_all_states(message):
                 pass
         bot.send_message(user_id, "✅ আপনার মেসেজ অ্যাডমিনের কাছে পাঠানো হয়েছে।")
 
-if __name__ == "__main__":
+# ================= WEB SERVER FOR RENDER =================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is alive!", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+def run_bot():
     init_db()
-    print("Bot is running...")
-    bot.infinity_polling()
+    bot.infinity_polling(none_stop=True, interval=1, timeout=20)
+
+if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
+    run_bot()
