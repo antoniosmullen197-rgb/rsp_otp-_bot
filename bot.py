@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import datetime
 import json
 import logging
@@ -80,7 +81,7 @@ def init_db() -> None:
             name TEXT NOT NULL,
             flag TEXT DEFAULT '🌍',
             dial TEXT DEFAULT '+1',
-            service TEXT DEFAULT 'OTP',
+            service TEXT DEFAULT 'Facebook',
             rate REAL DEFAULT 15.0
         )
         """
@@ -192,6 +193,7 @@ def init_db() -> None:
         "api_url": ENV_API_URL,
         "api_key": ENV_API_KEY,
         "voltex_rid": "",
+        "default_service": "Facebook",
         "support_contact": "@reyad0045",
         "support_mode": "LIVE",
         "support_link": "https://t.me/reyad0045",
@@ -250,7 +252,7 @@ def get_all_countries() -> dict[str, dict]:
             "name": str(name or c_key.upper()),
             "flag": str(flag or "🌍"),
             "dial": str(dial or "+1"),
-            "service": str(service or "OTP"),
+            "service": str(service or "Facebook"),
             "rate": float(rate if rate is not None else 15.0),
             "is_custom": True,
         }
@@ -271,7 +273,7 @@ def add_or_update_country(
     dial: str = "+1",
     rate: float = 15.0,
     flag: str = "🌍",
-    service: str = "OTP",
+    service: str = "Facebook",
 ) -> tuple[bool, str]:
     clean_code = re.sub(r"[^a-z0-9_]", "", str(country_code or "").strip().lower())
     clean_name = str(name or "").strip()
@@ -284,7 +286,7 @@ def add_or_update_country(
     clean_dial = re.sub(r"[^+\d]", "", clean_dial) or "+1"
 
     clean_flag = str(flag or "🌍").strip() or "🌍"
-    clean_service = str(service or "OTP").strip() or "OTP"
+    clean_service = str(service or "Facebook").strip() or "Facebook"
     clean_rate = max(0.0, float(rate))
 
     conn = get_conn()
@@ -730,69 +732,150 @@ def pick_manual_number(country: str, user_id: int):
     return int(num_id), str(phone)
 
 
-def _extract_phone_from_text(text: str) -> str:
-    if not text:
+def _try_decode_base64_text(text: str) -> str:
+    compact = re.sub(r"\s+", "", text or "")
+    if len(compact) < 16 or not re.fullmatch(r"[A-Za-z0-9+/=_-]+", compact):
         return ""
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            container = data.get("data") if isinstance(data.get("data"), dict) else data
-            for key in (
-                "full_number",
-                "phone",
-                "number",
-                "phone_number",
-                "mobile",
-                "msisdn",
-                "no_plus_number",
-                "national_number",
+    padded = compact + ("=" * ((4 - len(compact) % 4) % 4))
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            raw = decoder(padded)
+            decoded = raw.decode("utf-8", errors="ignore").strip()
+            if decoded and any(
+                ch in decoded
+                for ch in ("{", "[", "+", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
             ):
-                val = container.get(key) if isinstance(container, dict) else None
-                if val is not None and str(val).strip():
-                    s_val = str(val).strip()
-                    if key in ("no_plus_number", "national_number") and not s_val.startswith("+"):
-                        return "+" + s_val
-                    return s_val
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\+?\d{8,15}", text)
-    return match.group(0) if match else ""
+                return decoded
+        except Exception:
+            continue
+    return ""
+
+
+def _parse_panel_number_details(text: str) -> dict[str, str]:
+    result = {
+        "phone": "",
+        "country": "",
+        "operator": "",
+        "service": get_setting("default_service", "Facebook") or "Facebook",
+    }
+    if not text:
+        return result
+
+    candidates = [text]
+    b64_text = _try_decode_base64_text(text)
+    if b64_text:
+        candidates.append(b64_text)
+
+    for item_text in candidates:
+        try:
+            data = json.loads(item_text)
+            if isinstance(data, dict):
+                container = data.get("data") if isinstance(data.get("data"), dict) else data
+                if isinstance(container, dict):
+                    for key in (
+                        "full_number",
+                        "phone",
+                        "number",
+                        "phone_number",
+                        "mobile",
+                        "msisdn",
+                        "no_plus_number",
+                        "national_number",
+                    ):
+                        val = container.get(key)
+                        if val is not None and str(val).strip():
+                            s_val = str(val).strip()
+                            if key in ("no_plus_number", "national_number") and not s_val.startswith("+"):
+                                s_val = "+" + s_val
+                            result["phone"] = s_val
+                            break
+
+                    for c_key in ("country", "country_name", "range", "range_name"):
+                        c_val = container.get(c_key)
+                        if c_val is not None and str(c_val).strip():
+                            result["country"] = str(c_val).strip()
+                            break
+
+                    for op_key in ("operator", "carrier", "network"):
+                        op_val = container.get(op_key)
+                        if op_val is not None and str(op_val).strip():
+                            result["operator"] = str(op_val).strip()
+                            break
+
+                    for srv_key in ("service", "sid", "app"):
+                        srv_val = container.get(srv_key)
+                        if srv_val is not None and str(srv_val).strip():
+                            result["service"] = str(srv_val).strip()
+                            break
+
+                if result["phone"]:
+                    return result
+        except json.JSONDecodeError:
+            pass
+
+        match = re.search(r"\+\d{8,15}", item_text)
+        if match and not result["phone"]:
+            result["phone"] = match.group(0)
+            return result
+
+    return result
+
+
+def _extract_phone_from_text(text: str) -> str:
+    return _parse_panel_number_details(text).get("phone", "")
 
 
 def _extract_otp_from_text(text: str, expected_phone: str = "") -> str | None:
     if not text:
         return None
+
+    clean_target = re.sub(r"\D", "", expected_phone or "")
+    if not clean_target:
+        return None
+
     try:
         data = json.loads(text)
         if isinstance(data, dict):
             container = data.get("data") if isinstance(data.get("data"), dict) else data
             otps_list = container.get("otps") if isinstance(container, dict) else None
-            if isinstance(otps_list, list) and otps_list:
-                clean_target = re.sub(r"\D", "", expected_phone or "")
-                chosen_item = None
-                if clean_target:
-                    for item in otps_list:
-                        if isinstance(item, dict):
-                            item_num = re.sub(r"\D", "", str(item.get("number", "")))
-                            if item_num and (
-                                item_num == clean_target
-                                or item_num.endswith(clean_target)
-                                or clean_target.endswith(item_num)
-                            ):
-                                chosen_item = item
-                                break
-                if chosen_item is None:
-                    for item in otps_list:
-                        if isinstance(item, dict) and str(item.get("message", "")).strip():
-                            chosen_item = item
-                            break
-                if isinstance(chosen_item, dict):
-                    msg_val = str(chosen_item.get("message", "")).strip()
-                    code_match = re.search(r"\b\d{4,8}\b", msg_val)
-                    if code_match:
-                        return code_match.group(0)
-                    if msg_val:
+
+            if isinstance(otps_list, list):
+                for item in otps_list:
+                    if not isinstance(item, dict):
+                        continue
+                    item_num = re.sub(r"\D", "", str(item.get("number", "")))
+                    if not item_num:
+                        continue
+                    if (
+                        item_num == clean_target
+                        or item_num.endswith(clean_target)
+                        or clean_target.endswith(item_num)
+                    ):
+                        msg_val = str(item.get("message", "")).strip()
+                        if not msg_val:
+                            continue
+                        code_match = re.search(r"\b\d{4,8}\b", msg_val)
+                        if code_match:
+                            return code_match.group(0)
                         return msg_val
+                return None
+
+            resp_num = re.sub(
+                r"\D",
+                "",
+                str(
+                    container.get("number")
+                    or container.get("phone")
+                    or container.get("full_number")
+                    or ""
+                ),
+            )
+            if resp_num and not (
+                resp_num == clean_target
+                or resp_num.endswith(clean_target)
+                or clean_target.endswith(resp_num)
+            ):
+                return None
 
             for key in ("code", "otp", "sms", "message"):
                 val = container.get(key) if isinstance(container, dict) else None
@@ -801,13 +884,8 @@ def _extract_otp_from_text(text: str, expected_phone: str = "") -> str | None:
                     m = re.search(r"\b\d{4,8}\b", s_val)
                     return m.group(0) if m else s_val
     except json.JSONDecodeError:
-        pass
-    cleaned = text.strip()
-    m = re.search(r"\b\d{4,8}\b", cleaned)
-    if m:
-        return m.group(0)
-    if re.fullmatch(r"[A-Za-z0-9\-]{4,10}", cleaned):
-        return cleaned
+        return None
+
     return None
 
 
@@ -847,12 +925,9 @@ def _send_panel_http_request(
 def _resolve_voltex_rid(country_code: str = "") -> str:
     countries = get_all_countries()
     if country_code and country_code in countries:
-        c_info = countries[country_code]
-        dial_digits = re.sub(r"\D", "", str(c_info.get("dial", "")))
-        if dial_digits:
-            specific_rid = get_setting(f"voltex_rid_{country_code}", "")
-            if specific_rid:
-                return specific_rid.strip()
+        specific_rid = get_setting(f"voltex_rid_{country_code}", "")
+        if specific_rid:
+            return specific_rid.strip()
     configured_rid = get_setting("voltex_rid", "").strip()
     if configured_rid:
         return configured_rid
@@ -865,10 +940,10 @@ def _resolve_voltex_rid(country_code: str = "") -> str:
 
 def call_custom_panel_get_number(
     panel_row, country_code: str = ""
-) -> tuple[bool, str, str]:
+) -> tuple[bool, dict, str]:
     _, _, api_key, get_num_url, _, _ = panel_row
     if not get_num_url:
-        return False, "", "Get Number URL set kora nei."
+        return False, {}, "Get Number URL set kora nei."
 
     rid_val = _resolve_voltex_rid(country_code)
     target_url = (
@@ -893,19 +968,23 @@ def call_custom_panel_get_number(
         if country_code:
             q_params["country"] = country_code
         sep = "&" if "?" in target_url else "?"
-        get_url = f"{target_url}{sep}{urllib.parse.urlencode(q_params)}" if q_params else target_url
+        get_url = (
+            f"{target_url}{sep}{urllib.parse.urlencode(q_params)}"
+            if q_params
+            else target_url
+        )
         ok_get, body_get = _send_panel_http_request(
             get_url, api_key or "", method="GET"
         )
         if ok_get:
             ok, body = True, body_get
         else:
-            return False, "", body[:200]
+            return False, {}, body[:200]
 
-    phone = _extract_phone_from_text(body)
-    if phone:
-        return True, phone, body[:200]
-    return False, "", body[:200] if body else "Panel theke number pawa jayni."
+    details = _parse_panel_number_details(body)
+    if details.get("phone"):
+        return True, details, body[:200]
+    return False, {}, body[:200] if body else "Panel theke number pawa jayni."
 
 
 def fetch_sms_from_custom_panels(phone_number: str, country_code: str) -> str | None:
@@ -982,15 +1061,11 @@ def fetch_sms_from_panel(phone_number: str, country_code: str):
         {"action": "get_sms", "phone": phone_number, "country": country_code}
     )
     if isinstance(data, dict):
-        for key in ("code", "otp", "sms", "message"):
-            val = data.get(key)
-            if val is not None and str(val).strip():
-                return str(val).strip()
-        if isinstance(data.get("data"), dict):
-            for key in ("code", "otp", "sms", "message"):
-                val = data["data"].get(key)
-                if val is not None and str(val).strip():
-                    return str(val).strip()
+        otp_direct = _extract_otp_from_text(
+            json.dumps(data), expected_phone=phone_number
+        )
+        if otp_direct:
+            return otp_direct
     return fetch_sms_from_custom_panels(phone_number, country_code)
 
 
@@ -1099,6 +1174,7 @@ def admin_system_settings_keyboard() -> InlineKeyboardMarkup:
     n_req = get_setting("num_per_req", "3")
     n_shr = get_setting("num_per_share", "1")
     v_rid = get_setting("voltex_rid", "") or "Auto"
+    d_srv = get_setting("default_service", "Facebook") or "Facebook"
     return InlineKeyboardMarkup(
         [
             [
@@ -1111,7 +1187,7 @@ def admin_system_settings_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    f"💸 MIN W.: {min_w}", callback_data="adm_set_min_withdraw"
+                    f"📱 SERVICE: {d_srv}", callback_data="adm_set_default_service"
                 ),
                 InlineKeyboardButton(
                     f"🎁 REFER: {ref_r}", callback_data="adm_set_refer_reward"
@@ -1119,21 +1195,26 @@ def admin_system_settings_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    f"⏳ COOLDOWN: {cd}s", callback_data="adm_set_cooldown"
+                    f"💸 MIN W.: {min_w}", callback_data="adm_set_min_withdraw"
                 ),
                 InlineKeyboardButton(
-                    f"📞 NUM/REQ: {n_req}", callback_data="adm_set_num_per_req"
+                    f"⏳ COOLDOWN: {cd}s", callback_data="adm_set_cooldown"
                 ),
             ],
             [
                 InlineKeyboardButton(
+                    f"📞 NUM/REQ: {n_req}", callback_data="adm_set_num_per_req"
+                ),
+                InlineKeyboardButton(
                     f"🔢 NUM/SHARE: {n_shr}", callback_data="adm_set_num_per_share"
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     "🏦 W. METHODS", callback_data="adm_set_withdraw_methods"
                 ),
+                InlineKeyboardButton("➕ Add Admin ID", callback_data="adm_add_admin"),
             ],
-            [InlineKeyboardButton("➕ Add Admin ID", callback_data="adm_add_admin")],
         ]
     )
 
@@ -1235,6 +1316,22 @@ def countries_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _format_number_card_header(
+    country_label: str,
+    flag: str,
+    service_name: str,
+    refreshed_str: str,
+) -> str:
+    clean_service = service_name.strip() or "Facebook"
+    return (
+        f"╔══════════════════════╗\n"
+        f"  {flag} **{country_label}**\n"
+        f"  📱 **{clean_service}**\n"
+        f"  🔄 **Refreshed:** `{refreshed_str}`\n"
+        f"╚══════════════════════╝\n"
+    )
+
+
 async def send_number_card(
     chat_id: int,
     user_id: int,
@@ -1251,6 +1348,7 @@ async def send_number_card(
     now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
     stock_rows = get_number_stock_summary("unused")
     panels = list_api_panels()
+    default_service = get_setting("default_service", "Facebook") or "Facebook"
 
     active_orders = get_user_active_orders(user_id)
     active_note = ""
@@ -1273,20 +1371,20 @@ async def send_number_card(
 
     if code and code in countries:
         info = countries[code]
-        rate = get_country_rate(code)
-        header_block = (
-            f"╔══════════════════════╗\n"
-            f"  {info['flag']} **{info['name']} ({info['dial']})**\n"
-            f"  📱 **{info['service']}** • 💵 **৳{rate:.2f}**\n"
-            f"  🕒 **Updated:** `{now_str}`\n"
-            f"╚══════════════════════╝\n"
+        header_block = _format_number_card_header(
+            country_label=f"{info['name']} ({info['dial']})",
+            flag=info["flag"],
+            service_name=info.get("service") or default_service,
+            refreshed_str=now_str,
         )
     else:
-        header_block = (
-            f"╔══════════════════════╗\n"
-            f"  🌍 **No Country Added Yet**\n"
-            f"  🕒 **Updated:** `{now_str}`\n"
-            f"╚══════════════════════╝\n"
+        rid_val = get_setting("voltex_rid", "").strip()
+        c_title = f"Range {rid_val}" if rid_val else "Select Country / Panel"
+        header_block = _format_number_card_header(
+            country_label=c_title,
+            flag="🌍",
+            service_name=default_service,
+            refreshed_str=now_str,
         )
 
     await context.bot.send_message(
@@ -1322,7 +1420,7 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
         f"🔗 **API URL:** `{api_url if api_url else 'Not Set'}`",
         f"🔑 **API Key:** `{'Set' if api_key else 'Not Set'}`",
         f"📡 **API Status:** `{status_label}`",
-        f"🕒 **Updated:** `{now_str}`",
+        f"🕒 **Refreshed:** `{now_str}`",
     ]
 
     if countries:
@@ -1416,6 +1514,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     api_url = get_setting("api_url", "")
     api_key = get_setting("api_key", "")
     voltex_rid = get_setting("voltex_rid", "") or "Auto"
+    default_service = get_setting("default_service", "Facebook") or "Facebook"
     masked_key = (
         f"{api_key[:4]}***{api_key[-4:]}"
         if len(api_key) >= 8
@@ -1435,6 +1534,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🛠️ **Admin Panel**\n\n"
         f"🤖 **Bot:** {bot_name}\n"
         f"🌍 **Total Countries:** `{len(countries)}`\n"
+        f"📱 **Service:** `{default_service}`\n"
         f"🔢 **Voltex RID:** `{voltex_rid}`\n"
         f"🔗 **API URL:** `{api_url if api_url else 'Not Set'}`\n"
         f"🔑 **API Key:** `{masked_key}`\n"
@@ -1604,7 +1704,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.user_data["country_draft"]["rate"] = rate_val
             context.user_data["country_add_step"] = "flag_service"
             await update.message.reply_text(
-                "5️⃣ Flag এবং Service লিখুন (যেমন: `🇧🇪 Telegram` অথবা `skip` লিখুন):",
+                "5️⃣ Flag এবং Service লিখুন (যেমন: `🇧🇪 Facebook` অথবা `skip` লিখুন):",
                 parse_mode="Markdown",
             )
             return
@@ -1612,7 +1712,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             draft = context.user_data.pop("country_draft", {})
             context.user_data.pop("country_add_step", None)
             flag_val = "🌍"
-            service_val = "OTP"
+            service_val = get_setting("default_service", "Facebook") or "Facebook"
             if text.lower() != "skip" and text:
                 parts = text.split(maxsplit=1)
                 if len(parts) == 2:
@@ -1633,7 +1733,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             if ok:
                 await update.message.reply_text(
-                    f"🎉 **{draft.get('name')}** (`{res}`) সফলভাবে যুক্ত হয়েছে! Rate: `৳{float(draft.get('rate', 15.0)):.2f}`",
+                    f"🎉 **{draft.get('name')}** (`{res}`) সফলভাবে যুক্ত হয়েছে! Service: `{service_val}` • Rate: `৳{float(draft.get('rate', 15.0)):.2f}`",
                     parse_mode="Markdown",
                 )
             else:
@@ -1924,6 +2024,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     ensure_user(user.id, user.username or "", user.full_name or "")
     data = query.data
     countries = get_all_countries()
+    default_service = get_setting("default_service", "Facebook") or "Facebook"
+    now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
 
     if data == "user_live_chat":
         context.user_data["in_live_support"] = True
@@ -2022,7 +2124,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["awaiting_setting_key"] = s_key
         if s_key == "voltex_rid":
             await query.message.reply_text(
-                "🔢 Voltex range ID (`rid`, যেমন `26134`) লিখুন অথবা `clear` লিখুন:",
+                "🔢 Voltex range ID (`rid`, যেমন `2246566`) লিখুন অথবা `clear` লিখুন:",
+                parse_mode="Markdown",
+            )
+        elif s_key == "default_service":
+            await query.message.reply_text(
+                "📱 Service নাম লিখুন (যেমন: `Facebook`):",
                 parse_mode="Markdown",
             )
         else:
@@ -2066,7 +2173,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         context.user_data["panel_add_step"] = "name"
         await query.message.reply_text(
-            "1️⃣ প্যানেলের নাম লিখুন (যেমন: `Voltx` বা `5sim`):", parse_mode="Markdown"
+            "1️⃣ প্যানেলের নাম লিখুন (যেমন: `Voltex` বা `5sim`):", parse_mode="Markdown"
         )
 
     elif data.startswith("panel_del_"):
@@ -2224,16 +2331,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         matched_code = resolve_country_code(c_name)
         if matched_code and matched_code in countries:
             c_info = countries[matched_code]
-            country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
+            country_display = f"{c_info['flag']} {c_info['name']}"
+            service_display = c_info.get("service") or default_service
         else:
-            country_line = ""
+            country_display = f"🌍 {c_name}"
+            service_display = default_service
+
         rate = get_country_rate(matched_code)
         order_id = create_active_order(user.id, matched_code, phone_num)
+        header_box = _format_number_card_header(
+            country_label=country_display,
+            flag="",
+            service_name=service_display,
+            refreshed_str=now_str,
+        )
         await query.message.reply_text(
-            f"✅ **Stock Number Assigned!**\n\n"
+            f"{header_box}"
             f"🧾 **Order ID:** `#{order_id}`\n"
-            f"{country_line}"
-            f"📦 **Stock:** **{c_name}**\n"
             f"📱 **Phone:** `{phone_num}`\n"
             f"💵 **Rate:** `৳{rate:.2f}`\n"
             f"⏳ *এই নম্বরের OTP কোডের জন্য অপেক্ষা করুন।*",
@@ -2247,28 +2361,43 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text("❌ Panel পাওয়া যায়নি।")
             return
         _, _, active_code = get_user_profile(user.id)
-        ok, phone_num, resp_text = call_custom_panel_get_number(panel, active_code)
+        ok, details, resp_text = call_custom_panel_get_number(panel, active_code)
+        phone_num = details.get("phone", "")
         if not ok or not phone_num:
             await query.message.reply_text(
                 f"❌ **{panel[1]} Panel Error:**\n`{resp_text}`",
                 parse_mode="Markdown",
             )
             return
-        detected_code = (
-            resolve_country_code(phone_num) if phone_num.startswith("+") else active_code
+
+        raw_api_country = details.get("country", "")
+        detected_code = resolve_country_code(
+            raw_api_country or (phone_num if phone_num.startswith("+") else active_code)
         )
         if detected_code and detected_code in countries:
             c_info = countries[detected_code]
-            country_line = f"🌍 **Country:** {c_info['flag']} {c_info['name']} (`{c_info['dial']}`)\n"
+            country_display = f"{c_info['name']} ({c_info['dial']})"
+            flag_display = c_info["flag"]
+            service_display = c_info.get("service") or details.get("service") or default_service
         else:
-            country_line = ""
+            rid_val = get_setting("voltex_rid", "").strip()
+            country_display = raw_api_country or (
+                f"Range {rid_val}" if rid_val else panel[1]
+            )
+            flag_display = "🌍"
+            service_display = details.get("service") or default_service
+
         rate = get_country_rate(detected_code)
         order_id = create_active_order(user.id, detected_code, phone_num)
+        header_box = _format_number_card_header(
+            country_label=country_display,
+            flag=flag_display,
+            service_name=service_display,
+            refreshed_str=now_str,
+        )
         await query.message.reply_text(
-            f"✅ **Panel Number Assigned!**\n\n"
+            f"{header_box}"
             f"🧾 **Order ID:** `#{order_id}`\n"
-            f"{country_line}"
-            f"⚡ **Panel:** **{panel[1]}**\n"
             f"📱 **Phone:** `{phone_num}`\n"
             f"💵 **Rate:** `৳{rate:.2f}`\n"
             f"⏳ *এই নম্বরের OTP কোডের জন্য অপেক্ষা করুন।*",
@@ -2299,7 +2428,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             info = countries[c_code]
             rate = get_country_rate(c_code)
             await query.message.reply_text(
-                f"✅ Country set to {info['flag']} **{info['name']} (`{info['dial']}`)** — **৳{rate:.2f}**.",
+                f"✅ Country set to {info['flag']} **{info['name']} (`{info['dial']}`)** • Service: **{info.get('service', default_service)}** — **৳{rate:.2f}**.",
                 parse_mode="Markdown",
             )
             await send_number_card(
@@ -2387,7 +2516,7 @@ async def add_country_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if len(context.args) < 4:
         await update.message.reply_text(
             "Usage: `/addcountry <code> <name> <dial> <rate> [flag] [service]`\n"
-            "Example: `/addcountry be Belgium +32 18.00 🇧🇪 Telegram`",
+            "Example: `/addcountry be Belgium +32 18.00 🇧🇪 Facebook`",
             parse_mode="Markdown",
         )
         return
@@ -2402,7 +2531,11 @@ async def add_country_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠️ Rate must be a valid non-negative number.")
         return
     c_flag = context.args[4].strip() if len(context.args) >= 5 else "🌍"
-    c_service = " ".join(context.args[5:]).strip() if len(context.args) >= 6 else "OTP"
+    c_service = (
+        " ".join(context.args[5:]).strip()
+        if len(context.args) >= 6
+        else (get_setting("default_service", "Facebook") or "Facebook")
+    )
 
     ok, res = add_or_update_country(
         country_code=c_code,
@@ -2414,7 +2547,7 @@ async def add_country_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     if ok:
         await update.message.reply_text(
-            f"✅ Country **{c_name}** (`{res}`) added/updated — Rate: **৳{c_rate:.2f}**",
+            f"✅ Country **{c_name}** (`{res}`) added/updated — Service: `{c_service}` • Rate: **৳{c_rate:.2f}**",
             parse_mode="Markdown",
         )
     else:
@@ -2535,7 +2668,13 @@ async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, user_id, country_code, phone_number FROM orders WHERE status = 'ACTIVE' LIMIT 25"
+        """
+        SELECT id, user_id, country_code, phone_number
+        FROM orders
+        WHERE status = 'ACTIVE'
+          AND (julianday('now') - julianday(created_at)) * 86400 >= 10
+        LIMIT 25
+        """
     )
     active_rows = cursor.fetchall()
     conn.close()
