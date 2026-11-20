@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import threading
 import urllib.error
@@ -43,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-COUNTRIES = {
+BASE_COUNTRIES = {
     "it": {
         "name": "Italy",
         "flag": "🇮🇹",
@@ -119,6 +120,21 @@ def init_db() -> None:
     cursor.execute(
         "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
         (MAIN_ADMIN_ID,),
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS custom_countries (
+            country_code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            flag TEXT DEFAULT '🌍',
+            dial TEXT DEFAULT '+1',
+            service TEXT DEFAULT 'OTP',
+            rate REAL DEFAULT 15.0,
+            traffic INTEGER DEFAULT 120,
+            code_sample TEXT DEFAULT 'OTP-48291'
+        )
+        """
     )
 
     cursor.execute(
@@ -208,7 +224,7 @@ def init_db() -> None:
     if "last_req" not in user_cols:
         cursor.execute("ALTER TABLE users ADD COLUMN last_req REAL DEFAULT 0")
 
-    for code, info in COUNTRIES.items():
+    for code, info in BASE_COUNTRIES.items():
         cursor.execute(
             "INSERT OR IGNORE INTO country_rates (country_code, rate) VALUES (?, ?)",
             (code, float(info["rate"])),
@@ -219,7 +235,7 @@ def init_db() -> None:
         "api_url": ENV_API_URL,
         "api_key": ENV_API_KEY,
         "support_contact": "@reyad0045",
-        "support_mode": "LIVE",  # NORMAL, LIVE, BOTH
+        "support_mode": "LIVE",
         "support_link": "https://t.me/reyad0045",
         "otp_group": "https://t.me/reyad0045",
         "withdraw_status": "ON",
@@ -258,6 +274,116 @@ def init_db() -> None:
 
     conn.commit()
     conn.close()
+
+
+def get_all_countries() -> dict[str, dict]:
+    countries = {k: dict(v) for k, v in BASE_COUNTRIES.items()}
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT country_code, name, flag, dial, service, rate, traffic, code_sample
+        FROM custom_countries
+        """
+    )
+    for code, name, flag, dial, service, rate, traffic, sample in cursor.fetchall():
+        c_key = str(code).strip().lower()
+        if not c_key:
+            continue
+        countries[c_key] = {
+            "name": str(name or c_key.upper()),
+            "flag": str(flag or "🌍"),
+            "dial": str(dial or "+1"),
+            "service": str(service or "OTP"),
+            "rate": float(rate if rate is not None else 15.0),
+            "traffic": int(traffic if traffic is not None else 120),
+            "code_sample": str(sample or "OTP-48291"),
+            "is_custom": True,
+        }
+
+    cursor.execute("SELECT country_code, rate FROM country_rates")
+    for code, rate in cursor.fetchall():
+        c_key = str(code).strip().lower()
+        if c_key in countries and rate is not None:
+            countries[c_key]["rate"] = float(rate)
+
+    conn.close()
+    return countries
+
+
+def add_or_update_country(
+    country_code: str,
+    name: str,
+    dial: str = "+1",
+    rate: float = 15.0,
+    flag: str = "🌍",
+    service: str = "OTP",
+) -> tuple[bool, str]:
+    clean_code = re.sub(r"[^a-z0-9_]", "", str(country_code or "").strip().lower())
+    clean_name = str(name or "").strip()
+    if not clean_code or not clean_name:
+        return False, "সঠিক Country Code এবং Country Name দিন।"
+
+    clean_dial = str(dial or "+1").strip()
+    if not clean_dial.startswith("+"):
+        clean_dial = "+" + clean_dial
+    clean_dial = re.sub(r"[^+\d]", "", clean_dial) or "+1"
+
+    clean_flag = str(flag or "🌍").strip() or "🌍"
+    clean_service = str(service or "OTP").strip() or "OTP"
+    clean_rate = max(0.0, float(rate))
+    sample = f"{clean_service[:2].upper() or 'OT'}-{random.randint(10000, 99999)}"
+    traffic = random.randint(90, 240)
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO custom_countries
+            (country_code, name, flag, dial, service, rate, traffic, code_sample)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(country_code) DO UPDATE SET
+            name = excluded.name,
+            flag = excluded.flag,
+            dial = excluded.dial,
+            service = excluded.service,
+            rate = excluded.rate
+        """,
+        (clean_code, clean_name, clean_flag, clean_dial, clean_service, clean_rate, traffic, sample),
+    )
+    cursor.execute(
+        "INSERT OR REPLACE INTO country_rates (country_code, rate) VALUES (?, ?)",
+        (clean_code, clean_rate),
+    )
+    conn.commit()
+    conn.close()
+    return True, clean_code
+
+
+def delete_custom_country(country_code: str) -> bool:
+    c_key = str(country_code or "").strip().lower()
+    if not c_key or c_key in BASE_COUNTRIES:
+        return False
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM custom_countries WHERE country_code = ?", (c_key,))
+    cursor.execute("DELETE FROM country_rates WHERE country_code = ?", (c_key,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def resolve_country_code(raw_country) -> str:
+    countries = get_all_countries()
+    if isinstance(raw_country, str):
+        val = raw_country.strip().lower()
+        if val in countries:
+            return val
+        for code, info in countries.items():
+            if info["name"].strip().lower() == val:
+                return code
+    return "it" if "it" in countries else next(iter(countries.keys()))
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -314,7 +440,8 @@ def add_admin_id(new_admin_id: int) -> None:
 
 
 def get_country_rate(country_code: str) -> float:
-    code = country_code if country_code in COUNTRIES else "it"
+    countries = get_all_countries()
+    code = resolve_country_code(country_code)
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT rate FROM country_rates WHERE country_code = ?", (code,))
@@ -322,16 +449,20 @@ def get_country_rate(country_code: str) -> float:
     conn.close()
     if row and row[0] is not None:
         return float(row[0])
-    return float(COUNTRIES[code]["rate"])
+    return float(countries[code]["rate"])
 
 
 def set_country_rate(country_code: str, rate: float) -> None:
-    code = country_code if country_code in COUNTRIES else "it"
+    code = resolve_country_code(country_code)
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT OR REPLACE INTO country_rates (country_code, rate) VALUES (?, ?)",
         (code, float(rate)),
+    )
+    cursor.execute(
+        "UPDATE custom_countries SET rate = ? WHERE country_code = ?",
+        (float(rate), code),
     )
     conn.commit()
     conn.close()
@@ -343,6 +474,7 @@ def ensure_user(
     full_name: str = "",
     referred_by: int | None = None,
 ) -> bool:
+    default_c = resolve_country_code("it")
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
@@ -356,9 +488,9 @@ def ensure_user(
         cursor.execute(
             """
             INSERT INTO users (user_id, username, full_name, balance, otp_count, selected_country, referred_by)
-            VALUES (?, ?, ?, 0.0, 0, 'it', ?)
+            VALUES (?, ?, ?, 0.0, 0, ?, ?)
             """,
-            (user_id, username or "", full_name or "", ref_val),
+            (user_id, username or "", full_name or "", default_c, ref_val),
         )
     else:
         cursor.execute(
@@ -403,6 +535,8 @@ def deduct_all_user_balance(user_id: int) -> float:
 
 
 def get_user_profile(user_id: int):
+    countries = get_all_countries()
+    fallback_c = resolve_country_code("it")
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -412,26 +546,26 @@ def get_user_profile(user_id: int):
     row = cursor.fetchone()
     conn.close()
     if not row:
-        return 0.0, 0, "it"
-    country = row[2] if row[2] in COUNTRIES else "it"
+        return 0.0, 0, fallback_c
+    raw_c = str(row[2] or "").strip().lower()
+    country = raw_c if raw_c in countries else fallback_c
     return float(row[0] or 0.0), int(row[1] or 0), country
 
 
 def set_user_country(user_id: int, country_code: str) -> None:
-    if country_code not in COUNTRIES:
-        country_code = "it"
+    code = resolve_country_code(country_code)
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE users SET selected_country = ? WHERE user_id = ?",
-        (country_code, user_id),
+        (code, user_id),
     )
     conn.commit()
     conn.close()
 
 
 def create_active_order(user_id: int, country_code: str, phone_number: str) -> int:
-    code = country_code if country_code in COUNTRIES else "it"
+    code = resolve_country_code(country_code)
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -450,7 +584,7 @@ def create_active_order(user_id: int, country_code: str, phone_number: str) -> i
 def complete_order_and_reward(
     order_id: int, user_id: int, country_code: str, otp_code: str
 ) -> float:
-    code = country_code if country_code in COUNTRIES else "it"
+    code = resolve_country_code(country_code)
     rate = get_country_rate(code)
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
@@ -510,24 +644,30 @@ def get_daily_top_users(date_str: str, limit: int = 10):
 
 
 def generate_country_numbers(country_code: str, count: int = 3):
-    c_info = COUNTRIES.get(country_code, COUNTRIES["it"])
-    dial = c_info["dial"]
+    countries = get_all_countries()
+    code = resolve_country_code(country_code)
+    c_info = countries[code]
+    dial = str(c_info.get("dial") or "+1").strip()
+    if not dial.startswith("+"):
+        dial = "+" + dial
+    digits_only = re.sub(r"\D", "", dial)
+
     numbers = []
     for _ in range(count):
-        if dial == "+39":
+        if digits_only == "39":
             num = f"+393{random.randint(200000000, 999999999)}"
-        elif dial == "+880":
+        elif digits_only == "880":
             prefix = random.choice(["3", "4", "5", "6", "7", "8", "9"])
             num = f"+8801{prefix}{random.randint(10000000, 99999999)}"
-        elif dial == "+1":
+        elif digits_only == "1":
             num = f"+1{random.randint(201, 989)}{random.randint(2000000, 9999999)}"
-        elif dial == "+44":
+        elif digits_only == "44":
             num = f"+447{random.randint(100000000, 999999999)}"
-        elif dial == "+91":
+        elif digits_only == "91":
             prefix = random.choice(["6", "7", "8", "9"])
             num = f"+91{prefix}{random.randint(100000000, 999999999)}"
         else:
-            num = f"{dial}{random.randint(100000000, 999999999)}"
+            num = f"+{digits_only or '1'}{random.randint(200000000, 999999999)}"
         numbers.append(num)
     return numbers
 
@@ -579,13 +719,26 @@ def delete_api_panel(panel_id: int) -> None:
     conn.close()
 
 
-def upload_manual_numbers(country: str, raw_numbers: list[str]) -> int:
-    c_name = country.strip() or "General"
+def upload_manual_numbers(country, raw_numbers) -> int:
+    if isinstance(country, str) and country.strip():
+        c_name = country.strip()
+    elif country not in (None, False, True):
+        c_name = str(country).strip() or "General"
+    else:
+        c_name = "General"
+
+    if isinstance(raw_numbers, str):
+        items = raw_numbers.splitlines()
+    elif isinstance(raw_numbers, (list, tuple, set)):
+        items = list(raw_numbers)
+    else:
+        items = []
+
     conn = get_conn()
     cursor = conn.cursor()
     added = 0
-    for item in raw_numbers:
-        phone = item.strip()
+    for item in items:
+        phone = str(item or "").strip()
         if not phone:
             continue
         try:
@@ -717,6 +870,7 @@ def fetch_sms_from_panel(phone_number: str, country_code: str):
 
 
 def compute_traffic_scores():
+    countries = get_all_countries()
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -731,7 +885,7 @@ def compute_traffic_scores():
     conn.close()
 
     scores = {}
-    for code, info in COUNTRIES.items():
+    for code, info in countries.items():
         base_score = (
             int(info["traffic"])
             + (order_counts.get(code, 0) * 15)
@@ -756,7 +910,10 @@ def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("💵 Set Country Rates", callback_data="admin_rates_menu")],
+            [
+                InlineKeyboardButton("🌍 Manage Countries", callback_data="admin_countries_menu"),
+                InlineKeyboardButton("💵 Set Country Rates", callback_data="admin_rates_menu"),
+            ],
             [InlineKeyboardButton("⚙️ System Settings", callback_data="admin_sys_settings")],
             [InlineKeyboardButton("🌐 API Panel Manager", callback_data="admin_api_panels")],
             [InlineKeyboardButton("📤 Stock & Numbers", callback_data="admin_stock_menu")],
@@ -796,8 +953,9 @@ def admin_system_settings_keyboard() -> InlineKeyboardMarkup:
 
 
 def admin_rate_countries_keyboard() -> InlineKeyboardMarkup:
+    countries = get_all_countries()
     rows = []
-    for code, info in COUNTRIES.items():
+    for code, info in countries.items():
         rate = get_country_rate(code)
         rows.append(
             [
@@ -807,6 +965,25 @@ def admin_rate_countries_keyboard() -> InlineKeyboardMarkup:
                 )
             ]
         )
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_manage_countries_keyboard() -> InlineKeyboardMarkup:
+    countries = get_all_countries()
+    rows = [
+        [InlineKeyboardButton("➕ Add New Country", callback_data="add_country_start")]
+    ]
+    for code, info in countries.items():
+        rate = get_country_rate(code)
+        if info.get("is_custom"):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"🗑 Delete {info['flag']} {info['name']} ({code}) — ৳{rate:.2f}",
+                        callback_data=f"del_country_{code}",
+                    )
+                ]
+            )
     return InlineKeyboardMarkup(rows)
 
 
@@ -848,8 +1025,9 @@ def number_card_keyboard(
 
 
 def countries_keyboard() -> InlineKeyboardMarkup:
+    countries = get_all_countries()
     rows = []
-    for code, info in COUNTRIES.items():
+    for code, info in countries.items():
         rate = get_country_rate(code)
         rows.append(
             [
@@ -868,11 +1046,13 @@ async def send_number_card(
     context: ContextTypes.DEFAULT_TYPE,
     country_code: str | None = None,
 ) -> None:
+    countries = get_all_countries()
     _, _, current_country = get_user_profile(user_id)
-    code = country_code if country_code in COUNTRIES else current_country
+    candidate = country_code if country_code else current_country
+    code = resolve_country_code(candidate)
     set_user_country(user_id, code)
 
-    info = COUNTRIES[code]
+    info = countries[code]
     rate = get_country_rate(code)
     per_req = max(1, min(6, int(float(get_setting("num_per_req", "3") or 3))))
     numbers = generate_country_numbers(code, count=per_req)
@@ -897,6 +1077,7 @@ async def send_number_card(
 
 
 async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    countries = get_all_countries()
     api_url = get_setting("api_url", "")
     api_key = get_setting("api_key", "")
     now_str = datetime.datetime.now().strftime("%I:%M:%S %p")
@@ -904,7 +1085,7 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     panel_data, status_label = fetch_panel_traffic()
     scores = compute_traffic_scores()
     best_code = max(scores, key=scores.get)
-    best_info = COUNTRIES[best_code]
+    best_info = countries[best_code]
     custom_traffic_hdr = get_setting("text_traffic", "📊 **Live Traffic & Country Codes**")
 
     unused_total = sum(cnt for _, cnt in get_number_stock_summary("unused"))
@@ -924,7 +1105,7 @@ async def send_live_traffic(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
         "**Country Code Traffic Summary:**",
     ]
 
-    for code, info in COUNTRIES.items():
+    for code, info in countries.items():
         rate = get_country_rate(code)
         live_count = scores[code]
         sample_code = info["code_sample"]
@@ -998,6 +1179,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("⛔ This command is for admin only.")
         return
 
+    countries = get_all_countries()
     bot_name = get_setting("bot_name", "RSP OTP BOT")
     api_url = get_setting("api_url", "")
     api_key = get_setting("api_key", "")
@@ -1009,12 +1191,13 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     rate_lines = [
         f"  • `{code}` ({info['name']}): **৳{get_country_rate(code):.2f}**"
-        for code, info in COUNTRIES.items()
+        for code, info in countries.items()
     ]
 
     panel_text = (
         f"🛠️ **Admin Panel**\n\n"
         f"🤖 **Bot:** {bot_name}\n"
+        f"🌍 **Total Countries:** `{len(countries)}`\n"
         f"🔗 **Voltex URL:** `{api_url}`\n"
         f"🔑 **Voltex Key:** `{masked_key}`\n"
         f"🌐 **Custom Panels:** `{len(list_api_panels())}`\n"
@@ -1023,7 +1206,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         + "\n".join(rate_lines)
         + "\n\n"
         f"**Commands:**\n"
-        f"• `/setrate <it|bd|us|gb|in> <amount>`\n"
+        f"• `/addcountry <code> <name> <dial> <rate> [flag] [service]`\n"
+        f"• `/setrate <code> <amount>`\n"
         f"• `/setname <Bot Name>`\n"
         f"• `/setapiurl <https://...>`\n"
         f"• `/setapikey <API_KEY>`\n"
@@ -1062,9 +1246,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
     context.user_data.clear()
+    countries = get_all_countries()
     bot_name = get_setting("bot_name", "RSP OTP BOT")
     balance, otp_count, country_code = get_user_profile(user.id)
-    c_info = COUNTRIES[country_code]
+    c_info = countries[country_code]
     custom_start = get_setting("text_start", "")
 
     if custom_start:
@@ -1087,14 +1272,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.effective_user or not update.message or not update.message.document:
         return
     user = update.effective_user
-    if is_admin(user.id) and context.user_data.get("awaiting_upload_country"):
-        country_name = context.user_data.pop("awaiting_upload_country")
+    if not is_admin(user.id):
+        return
+
+    country_target = context.user_data.pop("awaiting_upload_numbers_for", None)
+    if not country_target:
+        country_target = context.user_data.pop("awaiting_upload_country", None)
+
+    if country_target:
         tg_file = await context.bot.get_file(update.message.document.file_id)
         file_bytes = await tg_file.download_as_bytearray()
         raw_lines = file_bytes.decode("utf-8", errors="ignore").splitlines()
-        added = upload_manual_numbers(country_name, raw_lines)
+        added = upload_manual_numbers(country_target, raw_lines)
         await update.message.reply_text(
-            f"✅ **{country_name}** এর জন্য `{added}` টি নতুন নম্বর ফাইল থেকে স্টকে যুক্ত হয়েছে।",
+            f"✅ **{country_target}** এর জন্য `{added}` টি নতুন নম্বর ফাইল থেকে স্টকে যুক্ত হয়েছে।",
             parse_mode="Markdown",
         )
 
@@ -1131,14 +1322,82 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Admin multi-step / state inputs
     if is_admin(user.id):
+        country_step = context.user_data.get("country_add_step")
+        if country_step == "code":
+            cleaned_code = re.sub(r"[^a-z0-9_]", "", text.lower())
+            if not cleaned_code:
+                await update.message.reply_text("⚠️ সঠিক short code দিন (যেমন: `be`, `de`, `ca`):")
+                return
+            context.user_data["country_draft"] = {"code": cleaned_code}
+            context.user_data["country_add_step"] = "name"
+            await update.message.reply_text("2️⃣ দেশের নাম লিখুন (যেমন: `Belgium`):", parse_mode="Markdown")
+            return
+        elif country_step == "name":
+            context.user_data["country_draft"]["name"] = text
+            context.user_data["country_add_step"] = "dial"
+            await update.message.reply_text("3️⃣ Dial Code লিখুন (যেমন: `+32`):", parse_mode="Markdown")
+            return
+        elif country_step == "dial":
+            context.user_data["country_draft"]["dial"] = text
+            context.user_data["country_add_step"] = "rate"
+            await update.message.reply_text("4️⃣ প্রতি OTP-তে কত টাকা (৳) দিবেন? সংখ্যা লিখুন (যেমন: `18.00`):", parse_mode="Markdown")
+            return
+        elif country_step == "rate":
+            try:
+                rate_val = float(text)
+                if rate_val < 0:
+                    raise ValueError()
+            except ValueError:
+                await update.message.reply_text("⚠️ সঠিক rate লিখুন (যেমন: `18.00`):")
+                return
+            context.user_data["country_draft"]["rate"] = rate_val
+            context.user_data["country_add_step"] = "flag_service"
+            await update.message.reply_text(
+                "5️⃣ Flag এবং Service লিখুন (যেমন: `🇧🇪 Telegram` অথবা `skip` লিখুন):",
+                parse_mode="Markdown",
+            )
+            return
+        elif country_step == "flag_service":
+            draft = context.user_data.pop("country_draft", {})
+            context.user_data.pop("country_add_step", None)
+            flag_val = "🌍"
+            service_val = "OTP"
+            if text.lower() != "skip" and text:
+                parts = text.split(maxsplit=1)
+                if len(parts) == 2:
+                    flag_val, service_val = parts[0], parts[1]
+                elif len(parts) == 1:
+                    if any(ord(ch) > 127 for ch in parts[0]):
+                        flag_val = parts[0]
+                    else:
+                        service_val = parts[0]
+
+            ok, res = add_or_update_country(
+                country_code=draft.get("code", ""),
+                name=draft.get("name", ""),
+                dial=draft.get("dial", "+1"),
+                rate=draft.get("rate", 15.0),
+                flag=flag_val,
+                service=service_val,
+            )
+            if ok:
+                await update.message.reply_text(
+                    f"🎉 **{draft.get('name')}** (`{res}`) সফলভাবে যুক্ত হয়েছে! Rate: `৳{float(draft.get('rate', 15.0)):.2f}`",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(f"⚠️ {res}")
+            return
+
         if context.user_data.get("awaiting_rate_country"):
             target_code = context.user_data.pop("awaiting_rate_country")
+            countries = get_all_countries()
             try:
                 amount = float(text)
                 if amount < 0:
                     raise ValueError()
                 set_country_rate(target_code, amount)
-                info = COUNTRIES[target_code]
+                info = countries.get(target_code, {"flag": "🌍", "name": target_code})
                 await update.message.reply_text(
                     f"✅ Rate set for {info['flag']} **{info['name']}** (`{target_code}`): **৳{amount:.2f}**",
                     parse_mode="Markdown",
@@ -1154,9 +1413,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if context.user_data.get("awaiting_setting_key"):
             s_key = context.user_data.pop("awaiting_setting_key")
-            set_setting(s_key, text)
+            val_to_save = "" if text.lower() == "clear" else text
+            set_setting(s_key, val_to_save)
             await update.message.reply_text(
-                f"✅ `{s_key}` আপডেট হয়ে `{text}` সেট হয়েছে।",
+                f"✅ `{s_key}` আপডেট হয়ে `{val_to_save or '(empty)'}` সেট হয়েছে।",
                 parse_mode="Markdown",
             )
             return
@@ -1183,7 +1443,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         if context.user_data.get("awaiting_upload_country"):
-            c_name = context.user_data.pop("awaiting_upload_country")
+            context.user_data.pop("awaiting_upload_country")
+            c_name = text.strip() or "General"
             context.user_data["awaiting_upload_numbers_for"] = c_name
             await update.message.reply_text(
                 f"📥 **{c_name}** এর নম্বরগুলো নিচে পেস্ট করুন (প্রতি লাইনে একটি নম্বর) অথবা `.txt` ফাইল পাঠান:",
@@ -1255,7 +1516,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     text=(
                         f"💸 **New Withdrawal Request**\n\n"
                         f"• User ID: `{user.id}`\n"
-                        f"• User: {user.full_name} (@{user.username or 'N/A'})\n"
+                        f"• User: {user.full_name} (@{user.username or 'N_A'})\n"
                         f"• Method: **{method}**\n"
                         f"• Amount: `৳{bal:.2f}`\n"
                         f"• Details: `{text}`"
@@ -1404,6 +1665,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = query.from_user
     ensure_user(user.id, user.username or "", user.full_name or "")
     data = query.data
+    countries = get_all_countries()
 
     if data == "user_live_chat":
         context.user_data["in_live_support"] = True
@@ -1422,7 +1684,34 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    if data == "admin_rates_menu":
+    if data == "admin_countries_menu":
+        if not is_admin(user.id):
+            return
+        await query.message.reply_text(
+            "🌍 **Manage Countries** (নতুন দেশ যোগ করতে নিচের বাটনে চাপ দিন):",
+            parse_mode="Markdown",
+            reply_markup=admin_manage_countries_keyboard(),
+        )
+
+    elif data == "add_country_start":
+        if not is_admin(user.id):
+            return
+        context.user_data["country_add_step"] = "code"
+        await query.message.reply_text(
+            "1️⃣ দেশের short code লিখুন (যেমন: `be`, `de`, `ca`, `fr`):",
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("del_country_"):
+        if not is_admin(user.id):
+            return
+        c_code = data.replace("del_country_", "", 1)
+        if delete_custom_country(c_code):
+            await query.message.reply_text(f"✅ `{c_code}` দেশটি ডিলিট করা হয়েছে।", parse_mode="Markdown")
+        else:
+            await query.message.reply_text("⚠️ ডিফল্ট দেশ ডিলিট করা যাবে না।")
+
+    elif data == "admin_rates_menu":
         if not is_admin(user.id):
             return
         await query.message.reply_text(
@@ -1435,9 +1724,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not is_admin(user.id):
             return
         c_code = data.replace("admin_setrate_", "", 1)
-        if c_code in COUNTRIES:
+        if c_code in countries:
             context.user_data["awaiting_rate_country"] = c_code
-            info = COUNTRIES[c_code]
+            info = countries[c_code]
             curr = get_country_rate(c_code)
             await query.message.reply_text(
                 f"💵 {info['flag']} **{info['name']}** (`{c_code}`) current rate: `৳{curr:.2f}`\n"
@@ -1606,7 +1895,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text("❌ এই স্টকের নম্বর শেষ হয়ে গেছে।")
             return
         _, phone_num = picked
-        order_id = create_active_order(user.id, "it", phone_num)
+        matched_code = resolve_country_code(c_name)
+        order_id = create_active_order(user.id, matched_code, phone_num)
         await query.message.reply_text(
             f"✅ **Stock Number Activated!**\n\n🧾 Order: `#{order_id}`\n📦 Stock: **{c_name}**\n📱 Phone: `{phone_num}`",
             parse_mode="Markdown",
@@ -1618,7 +1908,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not panel:
             await query.message.reply_text("❌ Panel পাওয়া যায়নি।")
             return
-        ok, resp_text = call_custom_panel_get_number(panel)
+        _, resp_text = call_custom_panel_get_number(panel)
         await query.message.reply_text(
             f"⚡ **{panel[1]} Panel Response:**\n`{resp_text}`",
             parse_mode="Markdown",
@@ -1627,8 +1917,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("pick_"):
         parts = data.split("_", 2)
         if len(parts) == 3:
-            _, c_code, phone_number = parts
-            c_info = COUNTRIES.get(c_code, COUNTRIES["it"])
+            _, raw_c_code, phone_number = parts
+            c_code = resolve_country_code(raw_c_code)
+            c_info = countries[c_code]
             rate = get_country_rate(c_code)
             order_id = create_active_order(user.id, c_code, phone_number)
             reply_text = (
@@ -1642,7 +1933,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text(reply_text, parse_mode="Markdown")
 
     elif data.startswith("change_"):
-        c_code = data.replace("change_", "", 1)
+        c_code = resolve_country_code(data.replace("change_", "", 1))
         await send_number_card(
             query.message.chat_id, user.id, context, country_code=c_code
         )
@@ -1655,10 +1946,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
     elif data.startswith("setcountry_"):
-        c_code = data.replace("setcountry_", "", 1)
-        if c_code in COUNTRIES:
+        c_code = resolve_country_code(data.replace("setcountry_", "", 1))
+        if c_code in countries:
             set_user_country(user.id, c_code)
-            info = COUNTRIES[c_code]
+            info = countries[c_code]
             rate = get_country_rate(c_code)
             await query.message.reply_text(
                 f"✅ Country set to {info['flag']} **{info['name']} (`{info['dial']}`)** — **৳{rate:.2f}**.",
@@ -1673,18 +1964,62 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.reply_text(f"💬 OTP Group / Support: {support}")
 
 
+async def add_country_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 4:
+        await update.message.reply_text(
+            "Usage: `/addcountry <code> <name> <dial> <rate> [flag] [service]`\n"
+            "Example: `/addcountry be Belgium +32 18.00 🇧🇪 Telegram`",
+            parse_mode="Markdown",
+        )
+        return
+    c_code = context.args[0].strip()
+    c_name = context.args[1].strip()
+    c_dial = context.args[2].strip()
+    try:
+        c_rate = float(context.args[3].strip())
+        if c_rate < 0:
+            raise ValueError()
+    except ValueError:
+        await update.message.reply_text("⚠️ Rate must be a valid non-negative number.")
+        return
+    c_flag = context.args[4].strip() if len(context.args) >= 5 else "🌍"
+    c_service = " ".join(context.args[5:]).strip() if len(context.args) >= 6 else "OTP"
+
+    ok, res = add_or_update_country(
+        country_code=c_code,
+        name=c_name,
+        dial=c_dial,
+        rate=c_rate,
+        flag=c_flag,
+        service=c_service,
+    )
+    if ok:
+        await update.message.reply_text(
+            f"✅ Country **{c_name}** (`{res}`) added/updated — Rate: **৳{c_rate:.2f}**",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(f"⚠️ {res}")
+
+
 async def set_rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
         return
+    countries = get_all_countries()
     if len(context.args) < 2:
+        avail = ", ".join(f"`{k}`" for k in countries.keys())
         await update.message.reply_text(
-            "Usage: `/setrate <it|bd|us|gb|in> <amount>`", parse_mode="Markdown"
+            f"Usage: `/setrate <code> <amount>`\nAvailable: {avail}",
+            parse_mode="Markdown",
         )
         return
     c_code = context.args[0].strip().lower()
-    if c_code not in COUNTRIES:
+    if c_code not in countries:
+        avail = ", ".join(f"`{k}`" for k in countries.keys())
         await update.message.reply_text(
-            "Invalid country code. Use: `it`, `bd`, `us`, `gb`, or `in`.",
+            f"Invalid country code. Available: {avail}",
             parse_mode="Markdown",
         )
         return
@@ -1697,7 +2032,7 @@ async def set_rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     set_country_rate(c_code, amount)
-    info = COUNTRIES[c_code]
+    info = countries[c_code]
     await update.message.reply_text(
         f"✅ Rate updated for {info['flag']} **{info['name']}** (`{c_code}`): **৳{amount:.2f}**",
         parse_mode="Markdown",
@@ -1757,6 +2092,7 @@ async def set_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
+    countries = get_all_countries()
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -1766,13 +2102,14 @@ async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
     conn.close()
 
     for order_id, user_id, c_code, phone_number in active_rows:
-        otp_code = fetch_sms_from_panel(phone_number, c_code)
+        resolved_code = resolve_country_code(c_code)
+        otp_code = fetch_sms_from_panel(phone_number, resolved_code)
         if not otp_code:
             otp_code = f"{random.randint(100000, 999999)}"
 
-        reward = complete_order_and_reward(int(order_id), int(user_id), c_code, otp_code)
+        reward = complete_order_and_reward(int(order_id), int(user_id), resolved_code, otp_code)
         if reward > 0 or otp_code:
-            c_info = COUNTRIES.get(c_code, COUNTRIES["it"])
+            c_info = countries[resolved_code]
             try:
                 await context.bot.send_message(
                     chat_id=int(user_id),
@@ -1791,6 +2128,7 @@ async def job_poll_otps(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def job_auto_traffic_alert(context: ContextTypes.DEFAULT_TYPE) -> None:
+    countries = get_all_countries()
     scores = compute_traffic_scores()
     if not scores:
         return
@@ -1800,7 +2138,7 @@ async def job_auto_traffic_alert(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     set_setting("last_traffic_alert", best_code)
-    info = COUNTRIES[best_code]
+    info = countries[best_code]
     rate = get_country_rate(best_code)
     alert_text = (
         f"🚦 **High Traffic Alert!**\n\n"
@@ -1847,6 +2185,7 @@ def main() -> None:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("addcountry", add_country_cmd))
     app.add_handler(CommandHandler("setrate", set_rate_cmd))
     app.add_handler(CommandHandler("setname", set_bot_name))
     app.add_handler(CommandHandler("setapiurl", set_api_url))
